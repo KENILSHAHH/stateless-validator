@@ -5,13 +5,39 @@
 
 use std::net::SocketAddr;
 
+use alloy_primitives::B256;
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::info;
+pub use validator_core::RpcMethod;
+use validator_core::RpcMetrics;
 
 /// Default metrics port.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+/// Metrics callback implementation for RPC client.
+///
+/// This struct implements the `RpcMetrics` trait from validator-core,
+/// allowing the RPC client to report metrics through the stateless validator's
+/// Prometheus metrics system.
+pub struct ValidatorMetrics;
+
+impl RpcMetrics for ValidatorMetrics {
+    fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>) {
+        on_rpc_complete(method, success, duration_secs);
+    }
+
+    fn on_witness_fetch(
+        &self,
+        salt_size: usize,
+        kvs_count: usize,
+        salt_kvs_size: usize,
+        mpt_size: usize,
+    ) {
+        on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+    }
+}
 
 /// Metric name constants.
 pub mod names {
@@ -46,7 +72,6 @@ pub mod names {
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
     metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
-    metric!(WITNESS_FETCH_TIME, "witness_fetch_time_seconds");
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
 
     // Database
@@ -56,9 +81,9 @@ pub mod names {
 
     // Witness
     metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
-    metric!(SALT_WITNESS_KEYS, "salt_witness_keys");
-    metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_bytes");
     metric!(MPT_WITNESS_SIZE, "mpt_witness_size_bytes");
+    metric!(SALT_WITNESS_KEYS, "salt_witness_keys");
+    metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_size_bytes");
 }
 
 /// Initialize the Prometheus metrics exporter at the given address.
@@ -100,7 +125,6 @@ fn register_metric_descriptions() {
     describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made");
     describe_counter!(names::RPC_ERRORS_TOTAL, "RPC errors encountered");
     describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
-    describe_histogram!(names::WITNESS_FETCH_TIME, "Witness fetch time (s)");
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
 
     // Database
@@ -154,30 +178,14 @@ pub fn set_chain_heights(local: u64, remote: u64) {
     gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(local)) as f64);
 }
 
-pub fn on_chain_reorg(depth: u64) {
+pub fn on_chain_reorg(reverted_hashes: &[B256]) {
     counter!(names::REORGS_DETECTED).increment(1);
-    histogram!(names::REORG_DEPTH).record(depth as f64);
-}
-
-/// RPC method types for metrics tracking.
-#[derive(Debug, Clone, Copy)]
-pub enum RpcMethod {
-    EthGetCodeByHash,
-    EthGetBlockByNumber,
-    EthBlockNumber,
-    MegaGetBlockWitness,
-    MegaSetValidatedBlocks,
+    histogram!(names::REORG_DEPTH).record(reverted_hashes.len() as f64);
 }
 
 // RPC metrics
 pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f64>) {
-    let method_str = match method {
-        RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
-        RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
-        RpcMethod::EthBlockNumber => "eth_blockNumber",
-        RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
-        RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
-    };
+    let method_str = method.as_str();
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
     if !success {
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(1);
@@ -190,9 +198,6 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
             }
             RpcMethod::EthGetBlockByNumber => {
                 histogram!(names::BLOCK_FETCH_TIME).record(duration);
-            }
-            RpcMethod::MegaGetBlockWitness => {
-                histogram!(names::WITNESS_FETCH_TIME).record(duration);
             }
             _ => {}
         }
@@ -212,10 +217,10 @@ pub fn on_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
 }
 
-// Witness metrics
-pub fn on_witness_fetch(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
+/// Record witness fetch metrics.
+pub fn on_witness_fetch(salt_size: usize, kvs_count: usize, salt_kvs_size: usize, mpt_size: usize) {
     histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
-    histogram!(names::SALT_WITNESS_KEYS).record(keys_count as f64);
-    histogram!(names::SALT_WITNESS_KVS_SIZE).record(kvs_size as f64);
+    histogram!(names::SALT_WITNESS_KEYS).record(kvs_count as f64);
+    histogram!(names::SALT_WITNESS_KVS_SIZE).record(salt_kvs_size as f64);
     histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
 }
