@@ -751,7 +751,7 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
-    use validator_core::withdrawals::MptWitness;
+    use validator_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
 
     use super::*;
 
@@ -944,19 +944,20 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                let (_number_str, hash_str): (String, String) = params.parse().unwrap();
-
-                // Parse hash string to BlockHash
-                let block_hash = parse_block_hash(&hash_str).map_err(|e| {
-                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
+                // Parse the WitnessRequestKeys struct (single parameter with blockNumber and
+                // blockHash fields)
+                let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
+
+                let block_hash = keys.block_hash;
 
                 // Look up witness data by block hash
                 let salt_witness =
                     context.witness_data.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Witness for block {hash_str} not found"),
+                            format!("Witness for block {block_hash} not found"),
                         )
                     })?;
 
@@ -964,7 +965,7 @@ mod tests {
                     context.mpt_witness_data.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Witness for block {hash_str} not found"),
+                            format!("Witness for block {block_hash} not found"),
                         )
                     })?;
 

@@ -19,7 +19,7 @@ use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 
 /// Request keys for fetching block witness data.
 /// Format compatible with both upstream witness endpoint and worker-kv-demo Cloudflare RPC.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WitnessRequestKeys {
     /// Block number as U64.
