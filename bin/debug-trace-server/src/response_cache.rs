@@ -23,6 +23,8 @@ use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use quick_cache::{sync::Cache, Lifecycle, Weighter};
 use tracing::{debug, trace};
 
+use crate::metrics::{CacheMetrics, CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE};
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -331,6 +333,10 @@ struct ResponseCacheInner {
     /// Statistics
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Prometheus metrics for debug trace cache
+    metrics_debug_trace: CacheMetrics,
+    /// Prometheus metrics for parity trace cache
+    metrics_trace: CacheMetrics,
 }
 
 impl std::fmt::Debug for ResponseCache {
@@ -364,7 +370,17 @@ impl ResponseCache {
                 indices,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
+                metrics_debug_trace: CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE),
+                metrics_trace: CacheMetrics::new_for_cache(CACHE_TYPE_TRACE),
             }),
+        }
+    }
+
+    /// Returns the cache metrics for a given resource type.
+    fn metrics_for_resource(&self, resource: CachedResource) -> &CacheMetrics {
+        match resource {
+            CachedResource::DebugTraceBlock => &self.inner.metrics_debug_trace,
+            CachedResource::TraceBlock => &self.inner.metrics_trace,
         }
     }
 
@@ -378,10 +394,13 @@ impl ResponseCache {
     ) -> Option<serde_json::Value> {
         let key = ResponseCacheKey::new(resource, block_number, variant);
         let result = self.inner.cache.get(&key);
+        let metrics = self.metrics_for_resource(resource);
         if result.is_some() {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            metrics.record_hit();
         } else {
             self.inner.misses.fetch_add(1, Ordering::Relaxed);
+            metrics.record_miss();
         }
         result.map(|r| r.as_value())
     }
@@ -401,10 +420,13 @@ impl ResponseCache {
 
         let key = ResponseCacheKey::new(resource, block_number, variant);
         let result = self.inner.cache.get(&key);
+        let metrics = self.metrics_for_resource(resource);
         if result.is_some() {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            metrics.record_hit();
         } else {
             self.inner.misses.fetch_add(1, Ordering::Relaxed);
+            metrics.record_miss();
         }
         result.map(|r| (r.as_value(), block_number))
     }
@@ -445,10 +467,12 @@ impl ResponseCache {
         Fut: std::future::Future<Output = Result<serde_json::Value, E>>,
     {
         let key = ResponseCacheKey::new(resource, block_number, variant.clone());
+        let metrics = self.metrics_for_resource(resource);
 
         match self.inner.cache.get_value_or_guard_async(&key).await {
             Ok(cached) => {
                 self.inner.hits.fetch_add(1, Ordering::Relaxed);
+                metrics.record_hit();
                 trace!(
                     block_number,
                     resource = ?resource,
@@ -465,6 +489,7 @@ impl ResponseCache {
                 self.inner.indices.insert(block_hash, block_number, key);
 
                 self.inner.misses.fetch_add(1, Ordering::Relaxed);
+                metrics.record_miss();
 
                 debug!(
                     block_number,
@@ -523,11 +548,18 @@ impl ResponseCache {
         self.inner.cache.weight()
     }
 
-    /// Returns cache statistics.
+    /// Returns cache statistics and updates prometheus metrics.
     pub fn stats(&self) -> CacheStats {
+        let entry_count = self.inner.cache.len();
+        let total_bytes = self.inner.cache.weight();
+
+        // Update prometheus cache size metrics (both types share the same cache)
+        self.inner.metrics_debug_trace.set_size(entry_count, total_bytes as usize);
+        self.inner.metrics_trace.set_size(entry_count, total_bytes as usize);
+
         CacheStats {
-            entry_count: self.inner.cache.len() as u64,
-            total_bytes: self.inner.cache.weight(),
+            entry_count: entry_count as u64,
+            total_bytes,
             hits: self.inner.hits.load(Ordering::Relaxed),
             misses: self.inner.misses.load(Ordering::Relaxed),
         }

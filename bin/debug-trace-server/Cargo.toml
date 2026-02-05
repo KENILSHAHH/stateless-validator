@@ -22,6 +22,7 @@ eyre.workspace = true
 # RPC framework
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 metrics.workspace = true
+metrics-derive.workspace = true
 metrics-exporter-prometheus.workspace = true
 op-alloy-rpc-types.workspace = true
 

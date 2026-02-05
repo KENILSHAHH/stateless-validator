@@ -27,6 +27,8 @@ use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 use validator_core::{withdrawals::MptWitness, LightWitness, RpcClient, ValidatorDB};
 
+use crate::metrics::UpstreamMetrics;
+
 /// Block data bundle containing all information needed for stateless execution.
 ///
 /// This struct aggregates the block, its witness (state proof), and all
@@ -106,7 +108,6 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    #[instrument(skip(self), name = "get_block_data")]
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
         // Try to get block hash from local database first
         if let Some(db) = &self.validator_db {
@@ -134,7 +135,6 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    #[instrument(skip(self), name = "get_block_data_by_hash", fields(block_hash = %block_hash))]
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
         let start = std::time::Instant::now();
 
@@ -316,18 +316,30 @@ impl DataProvider {
     /// 3. Fetch block with full transactions
     /// 4. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
+        let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
+        let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
+
         // Fetch block without transactions first to get the number
-        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await?;
+        let start = std::time::Instant::now();
+        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
+        upstream_block.record_request(block.is_ok(), start.elapsed().as_secs_f64());
+        let block = block?;
 
         // Fetch witness with retry
-        let (salt_witness, _mpt_witness) =
-            self.fetch_witness_with_retry(block.header.number, block.header.hash).await?;
+        let start = std::time::Instant::now();
+        let witness_result =
+            self.fetch_witness_with_retry(block.header.number, block.header.hash).await;
+        upstream_witness.record_request(witness_result.is_ok(), start.elapsed().as_secs_f64());
+        let (salt_witness, _mpt_witness) = witness_result?;
 
         // Convert SaltWitness to LightWitness
         let witness = LightWitness::from(salt_witness);
 
         // Fetch block with full transactions
-        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true).await?;
+        let start = std::time::Instant::now();
+        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true).await;
+        upstream_block.record_request(block.is_ok(), start.elapsed().as_secs_f64());
+        let block = block?;
 
         // Extract code hashes and fetch contracts
         let code_hashes = validator_core::extract_code_hashes(&witness);
@@ -381,7 +393,7 @@ impl DataProvider {
                         block_hash = %block_hash,
                         retry_count,
                         elapsed_ms = start.elapsed().as_millis() as u64,
-                        %e,
+                        error = %e,
                         "Witness fetch failed, retrying"
                     );
                     last_error = Some(e);

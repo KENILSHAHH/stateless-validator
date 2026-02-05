@@ -1907,6 +1907,7 @@ dependencies = [
  "eyre",
  "jsonrpsee 0.24.10",
  "metrics",
+ "metrics-derive",
  "metrics-exporter-prometheus",
  "op-alloy-rpc-types",
  "quick_cache",
