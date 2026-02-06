@@ -409,8 +409,6 @@ impl DebugTraceRpcServer for RpcContext {
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
 
-        tracing::Span::current().record("block_number", block_num);
-
         let variant = ResponseVariant::from_geth_options(&opts);
 
         // Check cache
