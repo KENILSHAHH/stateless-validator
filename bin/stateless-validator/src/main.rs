@@ -161,6 +161,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         rpc_config,
+        None, // No Cloudflare fallback for validator
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
@@ -890,10 +891,13 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                let (_number_str, hash_str): (String, String) = params.parse().unwrap();
+                // Parse two string parameters: block number (hex) and block hash
+                let (_block_number_hex, block_hash_hex): (String, String) =
+                    params.parse().map_err(|e| {
+                        make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                    })?;
 
-                // Parse hash string to BlockHash
-                let block_hash = parse_block_hash(&hash_str).map_err(|e| {
+                let block_hash = parse_block_hash(&block_hash_hex).map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
                 })?;
 
@@ -902,7 +906,7 @@ mod tests {
                     context.witness_data.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Witness for block {hash_str} not found"),
+                            format!("Witness for block {block_hash} not found"),
                         )
                     })?;
 
@@ -910,7 +914,7 @@ mod tests {
                     context.mpt_witness_data.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Witness for block {hash_str} not found"),
+                            format!("Witness for block {block_hash} not found"),
                         )
                     })?;
 

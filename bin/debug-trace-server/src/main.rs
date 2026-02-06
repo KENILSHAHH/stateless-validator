@@ -84,6 +84,10 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT")]
     witness_endpoint: String,
 
+    /// Optional Cloudflare witness endpoint URL for pruned/archived blocks.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_CLOUDFLARE_WITNESS_ENDPOINT")]
+    cloudflare_witness_endpoint: Option<String>,
+
     /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
     metrics_enabled: bool,
@@ -206,6 +210,7 @@ async fn main() -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         RpcClientConfig::trace_server(),
+        args.cloudflare_witness_endpoint.as_deref(),
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 

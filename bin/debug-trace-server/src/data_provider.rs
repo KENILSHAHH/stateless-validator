@@ -5,10 +5,12 @@
 //!
 //! 1. **Local Database** (fast) - ValidatorDB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
+//! 3. **Cloudflare KV** (archive) - Optional fallback for pruned/old blocks (via RpcClient)
 //!
 //! # Features
 //! - **Single-flight request coalescing**: Prevents duplicate RPC calls for the same block
 //! - **Witness fetch retry**: Automatic retry with configurable timeout for witness data
+//! - **Height-based witness routing**: Routes to appropriate source based on block height
 //! - **Contract bytecode fetching**: Fetches contract code alongside block data
 //!
 //! # Note
@@ -63,12 +65,13 @@ type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 /// # Data Lookup Strategy
 /// 1. Check local ValidatorDB (if configured)
 /// 2. Fetch from remote RPC endpoints
+/// 3. Fall back to Cloudflare KV (if configured in RpcClient) for pruned blocks
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
 /// RPC call is made. Other requests subscribe to the result via broadcast channel.
 pub struct DataProvider {
-    /// RPC client for upstream data fetching.
+    /// RPC client for upstream data fetching (includes optional Cloudflare fallback).
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks.
     validator_db: Option<Arc<ValidatorDB>>,
@@ -82,7 +85,7 @@ impl DataProvider {
     /// Creates a new data provider.
     ///
     /// # Arguments
-    /// * `rpc_client` - RPC client for upstream data fetching
+    /// * `rpc_client` - RPC client for upstream data fetching (may include Cloudflare fallback)
     /// * `validator_db` - Optional local database for cached block data
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
@@ -90,6 +93,10 @@ impl DataProvider {
         validator_db: Option<Arc<ValidatorDB>>,
         witness_timeout_secs: u64,
     ) -> Self {
+        if rpc_client.has_cloudflare_provider() {
+            debug!("Cloudflare witness fallback enabled via RpcClient");
+        }
+
         Self {
             rpc_client,
             validator_db,
@@ -312,9 +319,10 @@ impl DataProvider {
     ///
     /// Performs the complete fetch sequence:
     /// 1. Fetch block header (without transactions) to get block number
-    /// 2. Fetch witness data with retry logic
-    /// 3. Fetch block with full transactions
-    /// 4. Extract code hashes from witness and fetch contract bytecodes
+    /// 2. Determine witness source based on block height relative to DB range
+    /// 3. Fetch witness with appropriate routing (retry for new blocks, immediate fallback for old)
+    /// 4. Fetch block with full transactions
+    /// 5. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
         let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
         let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
@@ -324,11 +332,12 @@ impl DataProvider {
         let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
         upstream_block.record_request(block.is_ok(), start.elapsed().as_secs_f64());
         let block = block?;
+        let block_number = block.header.number;
 
-        // Fetch witness with retry
+        // Fetch witness with fallback routing
         let start = std::time::Instant::now();
         let witness_result =
-            self.fetch_witness_with_retry(block.header.number, block.header.hash).await;
+            self.fetch_witness_with_fallback(block_number, block.header.hash).await;
         upstream_witness.record_request(witness_result.is_ok(), start.elapsed().as_secs_f64());
         let (salt_witness, _mpt_witness) = witness_result?;
 
@@ -346,6 +355,110 @@ impl DataProvider {
         let contracts = self.get_contracts(&code_hashes).await?;
 
         Ok(BlockData { block, witness, contracts })
+    }
+
+    /// Fetches witness data from Cloudflare KV via RpcClient.
+    ///
+    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
+    async fn get_witness_from_cloudflare(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        match self.rpc_client.get_witness_from_cloudflare(block_number, block_hash).await {
+            Ok(result) => {
+                trace!(
+                    block_number,
+                    block_hash = %block_hash,
+                    "Witness fetched from Cloudflare"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                debug!(
+                    block_number,
+                    block_hash = %block_hash,
+                    error = %e,
+                    "Cloudflare witness fetch failed"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Fetches witness data with height-based routing and fallback.
+    ///
+    /// Routing logic:
+    /// - `block > db_max` → Retry witness endpoint (block is new, witness may be delayed), then
+    ///   Cloudflare fallback
+    /// - `block <= db_max` (or no DB) → Single witness attempt, then immediate Cloudflare fallback
+    ///   (block is old/pruned, no point retrying)
+    async fn fetch_witness_with_fallback(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        // Determine db_max_height if we have a database
+        let db_max_height = self
+            .validator_db
+            .as_ref()
+            .and_then(|db| db.get_local_tip().ok().flatten().map(|(height, _)| height));
+
+        let is_new_block = match db_max_height {
+            Some(max) => block_number > max,
+            None => true, // No DB means treat all blocks as "new" (try witness endpoint with retry)
+        };
+
+        if is_new_block {
+            // Block is newer than DB max: retry witness endpoint until timeout
+            trace!(
+                block_number,
+                db_max_height,
+                "Block is new, using retry loop for witness endpoint"
+            );
+
+            match self.fetch_witness_with_retry(block_number, block_hash).await {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    // Timeout reached, try Cloudflare fallback
+                    if self.rpc_client.has_cloudflare_provider() {
+                        trace!(
+                            block_number,
+                            %e,
+                            "Witness endpoint timeout, falling back to Cloudflare"
+                        );
+                        self.get_witness_from_cloudflare(block_number, block_hash).await
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        } else {
+            // Block is older/pruned: single attempt on witness endpoint, then immediate Cloudflare
+            trace!(
+                block_number,
+                db_max_height,
+                "Block is old/pruned, single attempt then Cloudflare fallback"
+            );
+
+            match self.rpc_client.get_witness(block_number, block_hash).await {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    // Single attempt failed, try Cloudflare fallback
+                    if self.rpc_client.has_cloudflare_provider() {
+                        trace!(
+                            block_number,
+                            %e,
+                            "Witness endpoint failed, falling back to Cloudflare"
+                        );
+                        self.get_witness_from_cloudflare(block_number, block_hash).await
+                    } else {
+                        // No Cloudflare configured and witness fetch failed
+                        Err(eyre::eyre!("Block witness not found for block {}", block_number))
+                    }
+                }
+            }
+        }
     }
 
     /// Fetches witness data with retry logic.

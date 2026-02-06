@@ -17,6 +17,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 
+/// Request keys for fetching block witness data.
+/// Format compatible with both upstream witness endpoint and worker-kv-demo Cloudflare RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessRequestKeys {
+    /// Block number as U64.
+    pub block_number: U64,
+    /// Block hash.
+    pub block_hash: B256,
+}
+
 /// RPC method identifiers for metrics tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcMethod {
@@ -128,6 +139,8 @@ pub struct RpcClient {
     pub data_provider: RootProvider<Optimism>,
     /// Witness provider for fetching SALT witness data.
     pub witness_provider: RootProvider,
+    /// Optional Cloudflare witness provider for pruned/archived blocks.
+    cloudflare_witness_provider: Option<RootProvider>,
     /// Configuration controlling verification behavior
     config: RpcClientConfig,
 }
@@ -139,7 +152,7 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
-        Self::new_with_config(data_api, witness_api, RpcClientConfig::default())
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None)
     }
 
     /// Creates a new RPC client with custom configuration.
@@ -148,16 +161,27 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     /// * `config` - Configuration controlling verification and transport behavior
+    /// * `cloudflare_witness_api` - Optional HTTP URL of the Cloudflare witness endpoint
     pub fn new_with_config(
         data_api: &str,
         witness_api: &str,
         config: RpcClientConfig,
+        cloudflare_witness_api: Option<&str>,
     ) -> Result<Self> {
+        let cloudflare_witness_provider = cloudflare_witness_api
+            .map(|url| -> Result<RootProvider> {
+                Ok(ProviderBuilder::default().connect_http(
+                    url.parse().context("Failed to parse Cloudflare witness API URL")?,
+                ))
+            })
+            .transpose()?;
+
         Ok(Self {
             data_provider: ProviderBuilder::<_, _, Optimism>::default()
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
+            cloudflare_witness_provider,
             config,
         })
     }
@@ -276,10 +300,13 @@ impl RpcClient {
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
+        // Format as hex strings - witness endpoint expects two string parameters
+        let block_number_hex = format!("0x{:x}", number);
+        let block_hash_hex = format!("{}", hash);
         let result: Result<(SaltWitness, MptWitness)> = self
             .witness_provider
             .client()
-            .request("mega_getBlockWitness", (number.to_string(), hash))
+            .request("mega_getBlockWitness", (block_number_hex, block_hash_hex))
             .await
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
 
@@ -310,6 +337,34 @@ impl RpcClient {
         }
 
         result
+    }
+
+    /// Returns whether a Cloudflare witness provider is configured.
+    pub fn has_cloudflare_provider(&self) -> bool {
+        self.cloudflare_witness_provider.is_some()
+    }
+
+    /// Gets execution witness data from the Cloudflare fallback endpoint.
+    ///
+    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
+    /// Returns error if Cloudflare provider is not configured.
+    pub async fn get_witness_from_cloudflare(
+        &self,
+        number: u64,
+        hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        let provider = self
+            .cloudflare_witness_provider
+            .as_ref()
+            .ok_or_else(|| eyre!("Cloudflare witness provider not configured"))?;
+
+        let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
+        let result: (SaltWitness, MptWitness) =
+            provider.client().request("mega_getBlockWitness", (keys,)).await.map_err(|e| {
+                eyre!("Cloudflare witness fetch failed for block {}: {}", number, e)
+            })?;
+
+        Ok(result)
     }
 
     /// Reports a range of validated blocks to the upstream node.
@@ -366,5 +421,111 @@ impl RpcClient {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_witness_request_keys_serialization() {
+        let keys = WitnessRequestKeys { block_number: U64::from(12345), block_hash: B256::ZERO };
+
+        let json = serde_json::to_string(&keys).unwrap();
+        // Should use camelCase
+        assert!(json.contains("blockNumber"));
+        assert!(json.contains("blockHash"));
+        assert!(!json.contains("block_number"));
+        assert!(!json.contains("block_hash"));
+    }
+
+    #[test]
+    fn test_rpc_client_config_default() {
+        let config = RpcClientConfig::default();
+        assert!(!config.skip_block_verification);
+        assert!(config.metrics.is_none());
+    }
+
+    #[test]
+    fn test_rpc_client_config_validator() {
+        let config = RpcClientConfig::validator();
+        assert!(!config.skip_block_verification);
+        assert!(config.metrics.is_none());
+    }
+
+    #[test]
+    fn test_rpc_client_config_trace_server() {
+        let config = RpcClientConfig::trace_server();
+        assert!(config.skip_block_verification);
+        assert!(config.metrics.is_none());
+    }
+
+    #[test]
+    fn test_rpc_method_as_str() {
+        assert_eq!(RpcMethod::EthGetCodeByHash.as_str(), "eth_getCodeByHash");
+        assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
+        assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
+        assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
+        assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
+    }
+
+    #[test]
+    fn test_new_with_invalid_url() {
+        let result = RpcClient::new("not a url", "http://localhost:8545");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_with_valid_url() {
+        let result = RpcClient::new("http://localhost:8545", "http://localhost:8546");
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert!(!client.has_cloudflare_provider());
+    }
+
+    #[test]
+    fn test_new_with_cloudflare_provider() {
+        let result = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::default(),
+            Some("http://localhost:9546"),
+        );
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert!(client.has_cloudflare_provider());
+    }
+
+    #[test]
+    fn test_new_with_invalid_cloudflare_url() {
+        let result = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::default(),
+            Some("not a url"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_skip_block_verification() {
+        let client = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::validator(),
+            None,
+        )
+        .unwrap();
+        assert!(!client.skip_block_verification());
+
+        let client = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::trace_server(),
+            None,
+        )
+        .unwrap();
+        assert!(client.skip_block_verification());
     }
 }

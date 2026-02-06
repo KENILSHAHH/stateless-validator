@@ -223,7 +223,7 @@ fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 /// Returns "block not found" for missing blocks/witnesses, internal error otherwise.
 fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    if err_str.contains("not found") || err_str.contains("timeout") {
+    if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("witness") {
         rpc_err_not_found(format!("block not found: {:#x}", block_num))
     } else {
         rpc_err("internal error".to_string())
@@ -233,7 +233,10 @@ fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObj
 /// Converts a block data fetch error (by hash) to an appropriate RPC error.
 fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    if err_str.contains("not found") || err_str.contains("timeout") {
+    if err_str.contains("not found") ||
+        err_str.contains("timeout") ||
+        err_str.contains("Failed to get witness")
+    {
         rpc_err_not_found(format!("block not found: hash {}", block_hash))
     } else {
         rpc_err("internal error".to_string())
@@ -243,7 +246,11 @@ fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types
 /// Converts a transaction lookup error to an appropriate RPC error.
 fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("pending") {
+    if err_str.contains("not found") ||
+        err_str.contains("timeout") ||
+        err_str.contains("pending") ||
+        err_str.contains("witness")
+    {
         rpc_err_not_found("transaction not found".to_string())
     } else {
         rpc_err("internal error".to_string())
