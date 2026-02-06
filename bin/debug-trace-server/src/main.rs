@@ -47,10 +47,10 @@ use alloy_primitives::{hex, BlockHash, B256};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{anyhow, ensure, Result};
-use jsonrpsee::server::{RpcModule, Server};
+use jsonrpsee::server::Server;
+use stateless_common::logging::LogArgs;
 use tokio::task;
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
     ValidatorDB,
@@ -151,6 +151,10 @@ struct Args {
         default_value_t = DEFAULT_PRUNER_INTERVAL_SECS
     )]
     pruner_interval_secs: u64,
+
+    /// Logging configuration.
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 /// Database filename for the validator's local storage.
@@ -171,15 +175,8 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "debug_trace_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let args = Args::parse();
+    let _log_guard = args.log.init_tracing()?;
 
     info!(
         listen_addr = %args.addr,
@@ -200,7 +197,7 @@ async fn main() -> Result<()> {
         match metrics::init_metrics(metrics_addr) {
             Ok(_) => info!(metrics_port = args.metrics_port, "Metrics enabled"),
             Err(e) => {
-                error!(%e, metrics_port = args.metrics_port, "Failed to initialize metrics");
+                error!(error = %e, metrics_port = args.metrics_port, "Failed to initialize metrics");
                 return Err(e);
             }
         }
@@ -248,6 +245,7 @@ async fn main() -> Result<()> {
 
         // Clone response_cache for the callback
         let cache_for_reorg = response_cache.clone();
+        let chain_sync_metrics = metrics::ChainSyncMetrics::create();
         task::spawn(remote_chain_tracker(
             Arc::clone(&rpc_client),
             Arc::clone(db),
@@ -258,6 +256,7 @@ async fn main() -> Result<()> {
                         count = reverted_hashes.len(),
                         "Invalidating response cache for reorged blocks"
                     );
+                    chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
                     cache_for_reorg.invalidate_blocks(reverted_hashes);
                 }
             }),
@@ -269,8 +268,19 @@ async fn main() -> Result<()> {
 
     // Create RPC context and module
     let ctx = RpcContext::new(data_provider, chain_spec, response_cache);
-    let mut module = RpcModule::new(ctx);
-    rpc_service::register_all_methods(&mut module)?;
+
+    // Spawn watch dog checker to monitor long-running requests
+    let watch_dog = ctx.watch_dog().clone();
+    task::spawn(async move {
+        watch_dog
+            .run_checker(
+                std::time::Duration::from_secs(5),  // check interval
+                std::time::Duration::from_secs(15), // warn threshold
+            )
+            .await;
+    });
+
+    let module = ctx.into_rpc_module()?;
 
     // Start server
     let server = Server::builder().max_response_body_size(u32::MAX).build(&args.addr).await?;
@@ -318,7 +328,7 @@ async fn init_validator_db(
                 Err(e) => {
                     warn!(
                         block_hash = %block_hash,
-                        %e,
+                        error = %e,
                         "Failed to fetch start block, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -332,7 +342,7 @@ async fn init_validator_db(
             match rpc_client.get_block(BlockId::latest(), false).await {
                 Ok(block) => break block,
                 Err(e) => {
-                    warn!(%e, "Failed to fetch latest block, retrying");
+                    warn!(error = %e, "Failed to fetch latest block, retrying");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
@@ -400,7 +410,7 @@ async fn history_pruner(
                         "Pruned old blocks from database"
                     );
                 }
-                Err(e) => warn!(%e, "Failed to prune old block data"),
+                Err(e) => warn!(error = %e, "Failed to prune old block data"),
                 _ => {}
             }
         }

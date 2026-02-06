@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
+use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
 use eyre::{Context, Result, ensure, eyre};
 use futures::future;
 use op_alloy_network::Optimism;
@@ -285,14 +285,16 @@ impl RpcClient {
 
     /// Gets just the block hash for a block number.
     ///
-    /// More efficient than get_block when only the hash is needed (e.g., for divergence checking).
+    /// Uses `eth_getHeaderByNumber` which is more efficient than fetching the full block
+    /// when only the hash is needed (e.g., for divergence checking).
     pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
-        let block = self
+        let header: Header = self
             .data_provider
-            .get_block(BlockId::Number(block_number.into()))
-            .await?
-            .ok_or_else(|| eyre!("Block {} not found", block_number))?;
-        Ok(block.header.hash)
+            .client()
+            .request("eth_getHeaderByNumber", (BlockNumberOrTag::Number(block_number),))
+            .await
+            .map_err(|e| eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number))?;
+        Ok(header.hash)
     }
 
     /// Gets execution witness data for a specific block.

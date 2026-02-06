@@ -170,13 +170,13 @@ pub async fn fetch_blocks_batch(
 
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
-    // Detect and resolve chain reorgs
-    match client.get_block(BlockId::Number(remote_tip.0.into()), false).await {
-        Ok(block) if block.header.hash != remote_tip.1 => {
+    // Detect and resolve chain reorgs (uses header-only RPC for efficiency)
+    match client.get_block_hash(remote_tip.0).await {
+        Ok(hash) if hash != remote_tip.1 => {
             warn!(
                 block_number = remote_tip.0,
                 expected_hash = %remote_tip.1,
-                actual_hash = %block.header.hash,
+                actual_hash = %hash,
                 "Hash mismatch detected, resolving chain divergence"
             );
 
@@ -430,7 +430,7 @@ pub async fn fetch_blocks_batch(
 /// * Never returns under normal operation - runs indefinitely until externally terminated
 pub async fn remote_chain_tracker<F>(
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     on_reorg: Option<F>,
 ) -> Result<()>
@@ -443,7 +443,7 @@ where
     let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
 
     loop {
-        match fetch_blocks_batch(&client, &validator_db, &config, &mut block_error_counts).await {
+        match fetch_blocks_batch(&client, &db, &config, &mut block_error_counts).await {
             Ok(result) => {
                 // Call reorg callback if a reorg occurred
                 if !result.reverted_hashes.is_empty() &&
