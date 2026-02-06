@@ -353,15 +353,25 @@ impl DataProvider {
         block_number: u64,
         block_hash: B256,
     ) -> Result<(SaltWitness, MptWitness)> {
-        let result = self.rpc_client.get_witness_from_cloudflare(block_number, block_hash).await?;
-
-        trace!(
-            block_number,
-            block_hash = %block_hash,
-            "Witness fetched from Cloudflare"
-        );
-
-        Ok(result)
+        match self.rpc_client.get_witness_from_cloudflare(block_number, block_hash).await {
+            Ok(result) => {
+                trace!(
+                    block_number,
+                    block_hash = %block_hash,
+                    "Witness fetched from Cloudflare"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                debug!(
+                    block_number,
+                    block_hash = %block_hash,
+                    error = %e,
+                    "Cloudflare witness fetch failed"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Fetches witness data with height-based routing and fallback.
