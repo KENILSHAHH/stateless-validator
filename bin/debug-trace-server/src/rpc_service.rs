@@ -1,40 +1,160 @@
 //! RPC Service Module
 //!
-//! Contains all RPC method registration and request handling logic.
+//! Contains all RPC method definitions and request handling logic using jsonrpsee proc-macros.
 //! Separates RPC concerns from the main server initialization.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
-use eyre::Result;
-use jsonrpsee::server::RpcModule;
+use dashmap::DashMap;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use tracing::{trace, warn};
 use validator_core::chain_spec::ChainSpec;
 
 use crate::{
     data_provider::{BlockData, DataProvider},
-    metrics,
+    metrics::{
+        self, RpcGlobalMetrics, TracingMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
+        METHOD_TRACE_TRANSACTION,
+    },
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
 };
 
-// ---------------------------------------------------------------------------
-// RPC Method Name Constants
-// ---------------------------------------------------------------------------
-
-const DEBUG_TRACE_BLOCK_BY_NUMBER: &str = "debug_traceBlockByNumber";
-const DEBUG_TRACE_BLOCK_BY_HASH: &str = "debug_traceBlockByHash";
-const DEBUG_TRACE_TRANSACTION: &str = "debug_traceTransaction";
-const TRACE_BLOCK: &str = "trace_block";
-const TRACE_TRANSACTION: &str = "trace_transaction";
-const DEBUG_GET_CACHE_STATUS: &str = "debug_getCacheStatus";
-
 /// Slow request threshold for logging warnings.
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// RPC Trait Definitions (proc-macro)
+// ---------------------------------------------------------------------------
+
+/// Geth-style debug tracing RPC methods.
+#[rpc(server, namespace = "debug")]
+pub trait DebugTraceRpc {
+    /// Trace block execution by block number.
+    #[method(name = "traceBlockByNumber")]
+    async fn trace_block_by_number(
+        &self,
+        block_number: BlockNumberOrTag,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Trace block execution by block hash.
+    #[method(name = "traceBlockByHash")]
+    async fn trace_block_by_hash(
+        &self,
+        block_hash: B256,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Trace a single transaction execution.
+    #[method(name = "traceTransaction")]
+    async fn trace_transaction(
+        &self,
+        tx_hash: B256,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Query current response cache status.
+    #[method(name = "getCacheStatus")]
+    async fn get_cache_status(&self) -> RpcResult<serde_json::Value>;
+}
+
+/// Parity/OpenEthereum-style trace RPC methods.
+#[rpc(server, namespace = "trace")]
+pub trait TraceRpc {
+    /// Parity-style block tracing (flat call traces).
+    #[method(name = "block")]
+    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<serde_json::Value>;
+
+    /// Parity-style transaction tracing.
+    /// Returns null (not error) when transaction is not found, matching mega-reth behavior.
+    #[method(name = "transaction")]
+    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<serde_json::Value>;
+}
+
+// ---------------------------------------------------------------------------
+// RPC Watch Dog
+// ---------------------------------------------------------------------------
+
+/// Tracks in-flight RPC requests and logs warnings for long-running ones.
+#[derive(Clone)]
+pub struct RpcWatchDog {
+    /// Active requests: request_id -> (method, params_summary, start_time)
+    active_requests: Arc<DashMap<u64, (&'static str, String, Instant)>>,
+    /// Monotonically increasing request ID counter.
+    next_id: Arc<AtomicU64>,
+    /// Prometheus metrics for inflight request tracking.
+    global_metrics: RpcGlobalMetrics,
+}
+
+impl RpcWatchDog {
+    /// Creates a new watch dog instance.
+    pub fn new() -> Self {
+        Self {
+            active_requests: Arc::new(DashMap::new()),
+            next_id: Arc::new(AtomicU64::new(0)),
+            global_metrics: RpcGlobalMetrics::create(),
+        }
+    }
+
+    /// Registers a new in-flight request. Returns a guard that automatically
+    /// deregisters the request when dropped.
+    fn start_request(&self, method: &'static str, params: String) -> WatchDogGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.active_requests.insert(id, (method, params, Instant::now()));
+        self.global_metrics.inc_inflight();
+        WatchDogGuard {
+            active_requests: Arc::clone(&self.active_requests),
+            global_metrics: self.global_metrics.clone(),
+            id,
+        }
+    }
+
+    /// Background task that periodically checks for long-running requests.
+    /// Logs a warning for any request exceeding the given threshold.
+    pub async fn run_checker(&self, interval: Duration, warn_threshold: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = Instant::now();
+            for entry in self.active_requests.iter() {
+                let (method, params, start) = entry.value();
+                let elapsed = now.duration_since(*start);
+                if elapsed > warn_threshold {
+                    warn!(
+                        method = %method,
+                        params = %params,
+                        elapsed_secs = elapsed.as_secs(),
+                        threshold_secs = warn_threshold.as_secs(),
+                        "Long-running RPC request detected"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard that deregisters an in-flight request when dropped.
+struct WatchDogGuard {
+    active_requests: Arc<DashMap<u64, (&'static str, String, Instant)>>,
+    global_metrics: RpcGlobalMetrics,
+    id: u64,
+}
+
+impl Drop for WatchDogGuard {
+    fn drop(&mut self) {
+        self.active_requests.remove(&self.id);
+        self.global_metrics.dec_inflight();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RPC Context
@@ -49,6 +169,8 @@ pub struct RpcContext {
     chain_spec: Arc<ChainSpec>,
     /// Response cache for HTTP layer caching.
     response_cache: ResponseCache,
+    /// Watch dog for tracking in-flight requests.
+    watch_dog: RpcWatchDog,
 }
 
 impl RpcContext {
@@ -58,7 +180,20 @@ impl RpcContext {
         chain_spec: Arc<ChainSpec>,
         response_cache: ResponseCache,
     ) -> Self {
-        Self { data_provider, chain_spec, response_cache }
+        Self { data_provider, chain_spec, response_cache, watch_dog: RpcWatchDog::new() }
+    }
+
+    /// Returns a reference to the watch dog for spawning the checker task.
+    pub fn watch_dog(&self) -> &RpcWatchDog {
+        &self.watch_dog
+    }
+
+    /// Creates the merged RPC module containing all methods.
+    pub fn into_rpc_module(self) -> eyre::Result<jsonrpsee::server::RpcModule<()>> {
+        let mut module = jsonrpsee::server::RpcModule::new(());
+        module.merge(DebugTraceRpcServer::into_rpc(self.clone()))?;
+        module.merge(TraceRpcServer::into_rpc(self))?;
+        Ok(module)
     }
 }
 
@@ -88,7 +223,6 @@ fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 /// Returns "block not found" for missing blocks/witnesses, internal error otherwise.
 fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    // Check for "not found" or "timeout" patterns - treat as resource not found
     if err_str.contains("not found") || err_str.contains("timeout") {
         rpc_err_not_found(format!("block not found: {:#x}", block_num))
     } else {
@@ -127,6 +261,7 @@ async fn compute_debug_trace_block(
     opts: GethDebugTracingOptions,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
+    let tracing_metrics = TracingMetrics::new_for_tracer("geth");
 
     let results = validator_core::trace_block(
         chain_spec,
@@ -138,6 +273,7 @@ async fn compute_debug_trace_block(
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
     let trace_ms = start.elapsed().as_millis();
+    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
 
     let value = serde_json::to_value(&results)
         .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
@@ -162,6 +298,9 @@ async fn compute_parity_trace_block(
     chain_spec: &ChainSpec,
     data: &BlockData,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    let start = Instant::now();
+    let tracing_metrics = TracingMetrics::new_for_tracer("parity");
+
     let results = validator_core::parity_trace_block(
         chain_spec,
         &data.block,
@@ -169,6 +308,8 @@ async fn compute_parity_trace_block(
         &data.contracts,
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+
+    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
 
     serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
 }
@@ -178,7 +319,6 @@ async fn compute_parity_trace_block(
 // ---------------------------------------------------------------------------
 
 /// Checks cache by block number and returns cached value if found.
-/// Records metrics and logs cache hit on success.
 fn check_cache_by_number(
     cache: &ResponseCache,
     resource: CachedResource,
@@ -204,7 +344,6 @@ fn check_cache_by_number(
 }
 
 /// Checks cache by block hash and returns cached value if found.
-/// Records metrics and logs cache hit on success.
 fn check_cache_by_hash(
     cache: &ResponseCache,
     resource: CachedResource,
@@ -230,239 +369,145 @@ fn check_cache_by_hash(
     Some(cached_value)
 }
 
-// ---------------------------------------------------------------------------
-// Block-Level Cached Trace Helper
-// ---------------------------------------------------------------------------
+/// Records metrics and logs for a completed request.
+fn record_request_completion(method_name: &'static str, block_num: u64, start: Instant) {
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    metrics::record_rpc_request(method_name, total_ms / 1000.0);
 
-/// Parameters for cached block trace execution.
-struct CachedTraceParams {
-    resource: CachedResource,
-    block_num: u64,
-    block_hash: B256,
-    variant: ResponseVariant,
-    method_name: &'static str,
-    start: Instant,
-    tx_count: usize,
-}
-
-/// Executes a block-level trace (cache miss case) and stores the result.
-///
-/// This function is called only when cache has already been checked and missed.
-/// It computes the trace, stores it in cache, and records metrics.
-async fn execute_cached_block_trace<F, Fut>(
-    ctx: &RpcContext,
-    params: CachedTraceParams,
-    compute: F,
-) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>
-where
-    F: FnOnce() -> Fut,
-    Fut:
-        std::future::Future<Output = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>>,
-{
-    let value = compute().await?;
-
-    ctx.response_cache.insert(
-        params.resource,
-        params.block_num,
-        params.block_hash,
-        params.variant,
-        value.clone(),
-    );
-
-    let total_ms = params.start.elapsed().as_secs_f64() * 1000.0;
-    metrics::record_rpc_request(params.method_name, total_ms / 1000.0);
-
-    trace!(
-        method = params.method_name,
-        block = params.block_num,
-        tx_count = params.tx_count,
-        total_ms = format!("{:.2}", total_ms),
-        cache_hit = false,
-        "Cache miss - computed and stored result"
-    );
-
-    if params.start.elapsed() > SLOW_REQUEST_THRESHOLD {
+    if start.elapsed() > SLOW_REQUEST_THRESHOLD {
         warn!(
-            method = params.method_name,
-            block_number = params.block_num,
+            method = method_name,
+            block_number = block_num,
             elapsed_ms = total_ms as u64,
             threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
             "RPC request exceeded threshold"
         );
     }
-
-    trace!(
-        method = params.method_name,
-        block_number = params.block_num,
-        elapsed_ms = total_ms as u64,
-        "Request completed"
-    );
-
-    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
-// RPC Method Registration
+// DebugTraceRpc Implementation
 // ---------------------------------------------------------------------------
 
-/// Registers all RPC methods on the module.
-pub fn register_all_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    register_debug_methods(module)?;
-    register_trace_methods(module)?;
-    register_cache_methods(module)?;
-    Ok(())
-}
-
-/// Registers all debug_* RPC methods (Geth-style).
-fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // debug_traceBlockByNumber
-    module.register_async_method(DEBUG_TRACE_BLOCK_BY_NUMBER, |params, ctx, _| async move {
+#[jsonrpsee::core::async_trait]
+impl DebugTraceRpcServer for RpcContext {
+    #[tracing::instrument(level = "trace", skip(self, opts), fields(block_number))]
+    async fn trace_block_by_number(
+        &self,
+        block_number: BlockNumberOrTag,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value> {
+        let _guard = self
+            .watch_dog
+            .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
         let start = Instant::now();
-        let mut seq = params.sequence();
-        let block_tag: BlockNumberOrTag = seq.next()?;
-        let opts: GethDebugTracingOptions = seq.optional_next()?.unwrap_or_default();
+        let opts = opts.unwrap_or_default();
 
-        let block_num = ctx
+        let block_num = self
             .data_provider
-            .resolve_block_number(block_tag)
+            .resolve_block_number(block_number)
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
 
-        trace!(
-            block_number = block_num,
-            method = DEBUG_TRACE_BLOCK_BY_NUMBER,
-            "Processing request"
-        );
-
         let variant = ResponseVariant::from_geth_options(&opts);
 
-        // Check cache before fetching block data
+        // Check cache
         if let Some(cached) = check_cache_by_number(
-            &ctx.response_cache,
+            &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_num,
             &variant,
-            DEBUG_TRACE_BLOCK_BY_NUMBER,
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             start,
         ) {
-            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
+            return Ok(cached);
         }
 
         // Fetch block data (DB -> RPC fallback)
-        let data = ctx
+        let data = self
             .data_provider
             .get_block_data(block_num)
             .await
             .map_err(|e| block_data_err(block_num, e))?;
         let block_hash = data.block.header.hash;
-        let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
 
-        // Store result in cache and return
-        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_NUMBER, total_ms / 1000.0);
-
-        // Cache the result for future requests
-        ctx.response_cache.insert(
+        // Cache and record metrics
+        self.response_cache.insert(
             CachedResource::DebugTraceBlock,
             block_num,
             block_hash,
             variant,
             result.clone(),
         );
+        record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, block_num, start);
 
         Ok(result)
-    })?;
+    }
 
-    // debug_traceBlockByHash
-    module.register_async_method(DEBUG_TRACE_BLOCK_BY_HASH, |params, ctx, _| async move {
+    #[tracing::instrument(level = "trace", skip(self, opts))]
+    async fn trace_block_by_hash(
+        &self,
+        block_hash: B256,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value> {
+        let _guard =
+            self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
-        let mut seq = params.sequence();
-        let block_hash: B256 = seq.next()?;
-        let opts: GethDebugTracingOptions = seq.optional_next()?.unwrap_or_default();
-
-        trace!(
-            block_hash = %block_hash,
-            method = DEBUG_TRACE_BLOCK_BY_HASH,
-            "Processing request"
-        );
+        let opts = opts.unwrap_or_default();
 
         let variant = ResponseVariant::from_geth_options(&opts);
 
-        // Check cache before fetching block data
+        // Check cache
         if let Some(cached) = check_cache_by_hash(
-            &ctx.response_cache,
+            &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_hash,
             &variant,
-            DEBUG_TRACE_BLOCK_BY_HASH,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             start,
         ) {
-            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
+            return Ok(cached);
         }
 
         // Fetch block data (DB -> RPC fallback)
-        let data = ctx
+        let data = self
             .data_provider
             .get_block_data_by_hash(block_hash)
             .await
             .map_err(|e| block_data_err_by_hash(block_hash, e))?;
         let block_num = data.block.header.number;
-        let tx_count = data.block.transactions.len();
-        let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
 
-        // Store result in cache and return
-        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_HASH, total_ms / 1000.0);
-
-        // Cache the result for future requests
-        ctx.response_cache.insert(
+        // Cache and record metrics
+        self.response_cache.insert(
             CachedResource::DebugTraceBlock,
             block_num,
             block_hash,
             variant,
             result.clone(),
         );
-
-        trace!(
-            method = DEBUG_TRACE_BLOCK_BY_HASH,
-            block = block_num,
-            tx_count,
-            total_ms = format!("{:.2}", total_ms),
-            cache_hit = false,
-            "Cache miss - computed and stored result"
-        );
-
-        if start.elapsed() > SLOW_REQUEST_THRESHOLD {
-            warn!(
-                method = DEBUG_TRACE_BLOCK_BY_HASH,
-                block_number = block_num,
-                elapsed_ms = total_ms as u64,
-                threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
-                "RPC request exceeded threshold"
-            );
-        }
+        record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
 
         Ok(result)
-    })?;
+    }
 
-    // debug_traceTransaction (not cached - depends on tx index)
-    module.register_async_method(DEBUG_TRACE_TRANSACTION, |params, ctx, _| async move {
+    #[tracing::instrument(level = "trace", skip(self, opts))]
+    async fn trace_transaction(
+        &self,
+        tx_hash: B256,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> RpcResult<serde_json::Value> {
+        let _guard =
+            self.watch_dog.start_request(METHOD_DEBUG_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
-        let mut seq = params.sequence();
-        let tx_hash: B256 = seq.next()?;
-        let opts: GethDebugTracingOptions = seq.optional_next()?.unwrap_or_default();
-
-        trace!(
-            tx_hash = %tx_hash,
-            method = DEBUG_TRACE_TRANSACTION,
-            "Processing request"
-        );
+        let opts = opts.unwrap_or_default();
 
         let (data, tx_index) =
-            ctx.data_provider.get_block_data_for_tx(tx_hash).await.map_err(tx_data_err)?;
+            self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(tx_data_err)?;
 
         let result = validator_core::trace_transaction(
-            &ctx.chain_spec,
+            &self.chain_spec,
             &data.block,
             tx_index,
             data.witness.clone(),
@@ -472,11 +517,12 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
         let elapsed = start.elapsed();
-        metrics::record_rpc_request(DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
+        metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
+        TracingMetrics::new_for_tracer("geth").record_transaction(elapsed.as_secs_f64());
 
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
-                method = DEBUG_TRACE_TRANSACTION,
+                method = METHOD_DEBUG_TRACE_TRANSACTION,
                 tx_hash = %tx_hash,
                 block_number = data.block.header.number,
                 elapsed_ms = elapsed.as_millis() as u64,
@@ -485,145 +531,13 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             );
         }
 
-        trace!(
-            method = DEBUG_TRACE_TRANSACTION,
-            tx_hash = %tx_hash,
-            block_number = data.block.header.number,
-            tx_index,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "Request completed"
-        );
-
         serde_json::to_value(&result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
-    })?;
+    }
 
-    Ok(())
-}
+    async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
+        let stats = self.response_cache.stats();
 
-/// Registers all trace_* RPC methods (Parity/OpenEthereum-style).
-fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // trace_block
-    module.register_async_method(TRACE_BLOCK, |params, ctx, _| async move {
-        let start = Instant::now();
-        let mut seq = params.sequence();
-        let block_tag: BlockNumberOrTag = seq.next()?;
-
-        let block_num = ctx
-            .data_provider
-            .resolve_block_number(block_tag)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
-
-        trace!(block_number = block_num, method = TRACE_BLOCK, "Processing request");
-
-        // Check cache before fetching block data
-        if let Some(cached) = check_cache_by_number(
-            &ctx.response_cache,
-            CachedResource::TraceBlock,
-            block_num,
-            &ResponseVariant::Default,
-            TRACE_BLOCK,
-            start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Fetch block data (DB -> RPC fallback)
-        let data = ctx
-            .data_provider
-            .get_block_data(block_num)
-            .await
-            .map_err(|e| block_data_err(block_num, e))?;
-
-        execute_cached_block_trace(
-            &ctx,
-            CachedTraceParams {
-                resource: CachedResource::TraceBlock,
-                block_num,
-                block_hash: data.block.header.hash,
-                variant: ResponseVariant::Default,
-                method_name: TRACE_BLOCK,
-                start,
-                tx_count: data.block.transactions.len(),
-            },
-            || compute_parity_trace_block(&ctx.chain_spec, &data),
-        )
-        .await
-    })?;
-
-    // trace_transaction (not cached - depends on tx index)
-    // Note: Returns null (not error) when transaction is not found, matching mega-reth behavior
-    module.register_async_method(TRACE_TRANSACTION, |params, ctx, _| async move {
-        let start = Instant::now();
-        let mut seq = params.sequence();
-        let tx_hash: B256 = seq.next()?;
-
-        trace!(
-            tx_hash = %tx_hash,
-            method = TRACE_TRANSACTION,
-            "Processing request"
-        );
-
-        // For trace_transaction, return null instead of error when tx not found
-        let (data, tx_index) = match ctx.data_provider.get_block_data_for_tx(tx_hash).await {
-            Ok(result) => result,
-            Err(e) => {
-                let err_str = e.to_string().to_lowercase();
-                if err_str.contains("not found") ||
-                    err_str.contains("pending") ||
-                    err_str.contains("timeout")
-                {
-                    // Return null for not found, matching mega-reth behavior
-                    return Ok(serde_json::Value::Null);
-                }
-                return Err(rpc_err("internal error".to_string()));
-            }
-        };
-
-        let result = validator_core::parity_trace_transaction(
-            &ctx.chain_spec,
-            &data.block,
-            tx_index,
-            data.witness.clone(),
-            &data.contracts,
-        )
-        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
-
-        let elapsed = start.elapsed();
-        metrics::record_rpc_request(TRACE_TRANSACTION, elapsed.as_secs_f64());
-
-        if elapsed > SLOW_REQUEST_THRESHOLD {
-            warn!(
-                method = TRACE_TRANSACTION,
-                tx_hash = %tx_hash,
-                block_number = data.block.header.number,
-                elapsed_ms = elapsed.as_millis() as u64,
-                threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
-                "RPC request exceeded threshold"
-            );
-        }
-
-        trace!(
-            method = TRACE_TRANSACTION,
-            tx_hash = %tx_hash,
-            block_number = data.block.header.number,
-            tx_index,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "Request completed"
-        );
-
-        serde_json::to_value(&result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
-    })?;
-
-    Ok(())
-}
-
-/// Registers cache management RPC methods.
-fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    module.register_async_method(DEBUG_GET_CACHE_STATUS, |_params, ctx, _| async move {
-        let stats = ctx.response_cache.stats();
-
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+        Ok(serde_json::json!({
             "responseCache": {
                 "entryCount": stats.entry_count,
                 "totalBytes": stats.total_bytes,
@@ -633,10 +547,114 @@ fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
                 "hitRate": format!("{:.1}%", stats.hit_rate())
             }
         }))
-    })?;
-
-    Ok(())
+    }
 }
+
+// ---------------------------------------------------------------------------
+// TraceRpc Implementation
+// ---------------------------------------------------------------------------
+
+#[jsonrpsee::core::async_trait]
+impl TraceRpcServer for RpcContext {
+    #[tracing::instrument(level = "trace", skip(self), fields(block_number))]
+    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<serde_json::Value> {
+        let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
+        let start = Instant::now();
+
+        let block_num = self
+            .data_provider
+            .resolve_block_number(block_number)
+            .await
+            .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+
+        tracing::Span::current().record("block_number", block_num);
+
+        // Check cache
+        if let Some(cached) = check_cache_by_number(
+            &self.response_cache,
+            CachedResource::TraceBlock,
+            block_num,
+            &ResponseVariant::Default,
+            METHOD_TRACE_BLOCK,
+            start,
+        ) {
+            return Ok(cached);
+        }
+
+        // Fetch block data (DB -> RPC fallback)
+        let data = self
+            .data_provider
+            .get_block_data(block_num)
+            .await
+            .map_err(|e| block_data_err(block_num, e))?;
+
+        let block_hash = data.block.header.hash;
+        let result = compute_parity_trace_block(&self.chain_spec, &data).await?;
+
+        // Cache and record metrics
+        self.response_cache.insert(
+            CachedResource::TraceBlock,
+            block_num,
+            block_hash,
+            ResponseVariant::Default,
+            result.clone(),
+        );
+        record_request_completion(METHOD_TRACE_BLOCK, block_num, start);
+
+        Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<serde_json::Value> {
+        let _guard = self.watch_dog.start_request(METHOD_TRACE_TRANSACTION, format!("{tx_hash}"));
+        let start = Instant::now();
+
+        // Return null instead of error when tx not found, matching mega-reth behavior
+        let (data, tx_index) = match self.data_provider.get_block_data_for_tx(tx_hash).await {
+            Ok(result) => result,
+            Err(e) => {
+                let err_str = e.to_string().to_lowercase();
+                if err_str.contains("not found") ||
+                    err_str.contains("pending") ||
+                    err_str.contains("timeout")
+                {
+                    return Ok(serde_json::Value::Null);
+                }
+                return Err(rpc_err("internal error".to_string()));
+            }
+        };
+
+        let result = validator_core::parity_trace_transaction(
+            &self.chain_spec,
+            &data.block,
+            tx_index,
+            data.witness.clone(),
+            &data.contracts,
+        )
+        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+
+        let elapsed = start.elapsed();
+        metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());
+        TracingMetrics::new_for_tracer("parity").record_transaction(elapsed.as_secs_f64());
+
+        if elapsed > SLOW_REQUEST_THRESHOLD {
+            warn!(
+                method = METHOD_TRACE_TRANSACTION,
+                tx_hash = %tx_hash,
+                block_number = data.block.header.number,
+                elapsed_ms = elapsed.as_millis() as u64,
+                threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
+                "RPC request exceeded threshold"
+            );
+        }
+
+        serde_json::to_value(&result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -650,30 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn test_method_name_constants() {
-        assert_eq!(DEBUG_TRACE_BLOCK_BY_NUMBER, "debug_traceBlockByNumber");
-        assert_eq!(DEBUG_TRACE_BLOCK_BY_HASH, "debug_traceBlockByHash");
-        assert_eq!(DEBUG_TRACE_TRANSACTION, "debug_traceTransaction");
-        assert_eq!(TRACE_BLOCK, "trace_block");
-        assert_eq!(TRACE_TRANSACTION, "trace_transaction");
-        assert_eq!(DEBUG_GET_CACHE_STATUS, "debug_getCacheStatus");
-    }
-
-    #[test]
-    fn test_cached_trace_params() {
-        let params = CachedTraceParams {
-            resource: CachedResource::DebugTraceBlock,
-            block_num: 12345,
-            block_hash: B256::ZERO,
-            variant: ResponseVariant::Default,
-            method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
-            start: Instant::now(),
-            tx_count: 5,
-        };
-
-        assert_eq!(params.block_num, 12345);
-        assert_eq!(params.method_name, "debug_traceBlockByNumber");
-        assert_eq!(params.tx_count, 5);
+    fn test_rpc_err_not_found() {
+        let err = rpc_err_not_found("block not found".to_string());
+        assert_eq!(err.code(), -32001);
+        assert_eq!(err.message(), "block not found");
     }
 
     #[test]
@@ -682,32 +680,6 @@ mod tests {
         let err = rpc_err(long_msg.clone());
         assert_eq!(err.code(), -32000);
         assert_eq!(err.message(), long_msg);
-    }
-
-    #[test]
-    fn test_cached_trace_params_variants() {
-        let debug_params = CachedTraceParams {
-            resource: CachedResource::DebugTraceBlock,
-            block_num: 100,
-            block_hash: B256::from([1u8; 32]),
-            variant: ResponseVariant::Default,
-            method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
-            start: Instant::now(),
-            tx_count: 10,
-        };
-
-        let trace_params = CachedTraceParams {
-            resource: CachedResource::TraceBlock,
-            block_num: 100,
-            block_hash: B256::from([1u8; 32]),
-            variant: ResponseVariant::Default,
-            method_name: TRACE_BLOCK,
-            start: Instant::now(),
-            tx_count: 3,
-        };
-
-        assert!(matches!(debug_params.resource, CachedResource::DebugTraceBlock));
-        assert!(matches!(trace_params.resource, CachedResource::TraceBlock));
     }
 
     #[test]
