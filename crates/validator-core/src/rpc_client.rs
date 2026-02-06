@@ -300,13 +300,11 @@ impl RpcClient {
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
-        // Format as hex strings - witness endpoint expects Vec<String>, not WitnessRequestKeys
-        let block_number_hex = format!("0x{:x}", number);
-        let block_hash_hex = format!("{}", hash);
+        let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
         let result: Result<(SaltWitness, MptWitness)> = self
             .witness_provider
             .client()
-            .request("mega_getBlockWitness", (block_number_hex, block_hash_hex))
+            .request("mega_getBlockWitness", (keys,))
             .await
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
 
