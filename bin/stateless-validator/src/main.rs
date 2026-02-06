@@ -698,7 +698,7 @@ mod tests {
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use tracing_subscriber::EnvFilter;
-    use validator_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
+    use validator_core::withdrawals::MptWitness;
 
     use super::*;
 
@@ -891,13 +891,15 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                // Parse the WitnessRequestKeys struct (single parameter with blockNumber and
-                // blockHash fields)
-                let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
-                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
-                })?;
+                // Parse two string parameters: block number (hex) and block hash
+                let (_block_number_hex, block_hash_hex): (String, String) =
+                    params.parse().map_err(|e| {
+                        make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                    })?;
 
-                let block_hash = keys.block_hash;
+                let block_hash = parse_block_hash(&block_hash_hex).map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
+                })?;
 
                 // Look up witness data by block hash
                 let salt_witness =
