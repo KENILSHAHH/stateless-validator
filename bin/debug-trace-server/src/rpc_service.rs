@@ -22,9 +22,9 @@ use validator_core::chain_spec::ChainSpec;
 use crate::{
     data_provider::{BlockData, DataProvider},
     metrics::{
-        self, RpcGlobalMetrics, TracingMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
-        METHOD_TRACE_TRANSACTION,
+        self, DataSourceMetrics, EvmExecutionMetrics, ResponseSizeMetrics, RpcGlobalMetrics,
+        SingleFlightMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
     },
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
 };
@@ -279,9 +279,9 @@ async fn compute_debug_trace_block(
     chain_spec: &ChainSpec,
     data: &BlockData,
     opts: GethDebugTracingOptions,
+    method_name: &'static str,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
-    let tracing_metrics = TracingMetrics::new_for_tracer("geth");
 
     let results = validator_core::trace_block(
         chain_spec,
@@ -293,13 +293,15 @@ async fn compute_debug_trace_block(
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
     let trace_ms = start.elapsed().as_millis();
-    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
+    EvmExecutionMetrics::new_for_method(method_name)
+        .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
     let value = serde_json::to_value(&results)
         .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = value.to_string().len();
+    ResponseSizeMetrics::new_for_method(method_name).record(response_size);
 
     if trace_ms >= SLOW_STAGE_THRESHOLD_MS || serialize_ms >= SLOW_STAGE_THRESHOLD_MS {
         warn!(
@@ -319,9 +321,9 @@ async fn compute_debug_trace_block(
 async fn compute_parity_trace_block(
     chain_spec: &ChainSpec,
     data: &BlockData,
+    method_name: &'static str,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
-    let tracing_metrics = TracingMetrics::new_for_tracer("parity");
 
     let results = validator_core::parity_trace_block(
         chain_spec,
@@ -331,9 +333,14 @@ async fn compute_parity_trace_block(
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
-    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
+    EvmExecutionMetrics::new_for_method(method_name)
+        .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
-    serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+    let value =
+        serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+    ResponseSizeMetrics::new_for_method(method_name).record(value.to_string().len());
+
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +360,8 @@ fn check_cache_by_number(
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
+    DataSourceMetrics::new_for_source("cache").record();
+    SingleFlightMetrics::new_for_type("bypassed").record();
 
     trace!(
         method = method_name,
@@ -378,6 +387,8 @@ fn check_cache_by_hash(
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
+    DataSourceMetrics::new_for_source("cache").record();
+    SingleFlightMetrics::new_for_type("bypassed").record();
 
     trace!(
         method = method_name,
@@ -460,10 +471,16 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 4: Execute trace
         let t3 = Instant::now();
-        let result =
-            compute_debug_trace_block(&self.chain_spec, &data, opts).await.inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            })?;
+        let result = compute_debug_trace_block(
+            &self.chain_spec,
+            &data,
+            opts,
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        )
+        .await
+        .inspect_err(|_| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+        })?;
         let trace_ms = t3.elapsed().as_millis();
 
         // Stage 5: Cache result
@@ -531,10 +548,16 @@ impl DebugTraceRpcServer for RpcContext {
             block_data_err_by_hash(block_hash, e)
         })?;
         let block_num = data.block.header.number;
-        let result =
-            compute_debug_trace_block(&self.chain_spec, &data, opts).await.inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            })?;
+        let result = compute_debug_trace_block(
+            &self.chain_spec,
+            &data,
+            opts,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        )
+        .await
+        .inspect_err(|_| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+        })?;
 
         // Cache and record metrics
         self.response_cache.insert(
@@ -566,6 +589,7 @@ impl DebugTraceRpcServer for RpcContext {
                 tx_data_err(e)
             })?;
 
+        let evm_start = Instant::now();
         let result = validator_core::trace_transaction(
             &self.chain_spec,
             &data.block,
@@ -578,10 +602,11 @@ impl DebugTraceRpcServer for RpcContext {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
+        EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
+            .record(evm_start.elapsed().as_secs_f64(), 1);
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
-        TracingMetrics::new_for_tracer("geth").record_transaction(elapsed.as_secs_f64());
 
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
@@ -594,7 +619,11 @@ impl DebugTraceRpcServer for RpcContext {
             );
         }
 
-        serde_json::to_value(&result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+        let value = serde_json::to_value(&result)
+            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+        ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
+            .record(value.to_string().len());
+        Ok(value)
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
@@ -651,8 +680,9 @@ impl TraceRpcServer for RpcContext {
         })?;
 
         let block_hash = data.block.header.hash;
-        let result =
-            compute_parity_trace_block(&self.chain_spec, &data).await.inspect_err(|_| {
+        let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
+            .await
+            .inspect_err(|_| {
                 metrics::record_rpc_error(METHOD_TRACE_BLOCK);
             })?;
 
@@ -690,6 +720,7 @@ impl TraceRpcServer for RpcContext {
             }
         };
 
+        let evm_start = Instant::now();
         let result = validator_core::parity_trace_transaction(
             &self.chain_spec,
             &data.block,
@@ -701,10 +732,11 @@ impl TraceRpcServer for RpcContext {
             metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
+        EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
+            .record(evm_start.elapsed().as_secs_f64(), 1);
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());
-        TracingMetrics::new_for_tracer("parity").record_transaction(elapsed.as_secs_f64());
 
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
@@ -717,7 +749,11 @@ impl TraceRpcServer for RpcContext {
             );
         }
 
-        serde_json::to_value(&result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+        let value = serde_json::to_value(&result)
+            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+        ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
+            .record(value.to_string().len());
+        Ok(value)
     }
 }
 
