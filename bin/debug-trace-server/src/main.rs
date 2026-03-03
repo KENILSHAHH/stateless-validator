@@ -223,10 +223,12 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
+    let response_cache_disabled = args.response_cache_estimated_items == 0;
     debug!(
         rpc_endpoint = %args.rpc_endpoint,
         witness_endpoint = %args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
+        response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         "Server configuration"
@@ -261,16 +263,21 @@ async fn main() -> Result<()> {
 
     let chain_spec = load_chain_spec(&args)?;
 
-    let response_cache = ResponseCache::new(ResponseCacheConfig::new(
-        args.response_cache_max_size,
-        args.response_cache_estimated_items,
-    ));
-
-    debug!(
-        max_bytes = args.response_cache_max_size,
-        estimated_items = args.response_cache_estimated_items,
-        "Response cache initialized"
-    );
+    let response_cache = if response_cache_disabled {
+        info!("Response cache disabled (estimated_items = 0)");
+        None
+    } else {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(
+            args.response_cache_max_size,
+            args.response_cache_estimated_items,
+        ));
+        debug!(
+            max_bytes = args.response_cache_max_size,
+            estimated_items = args.response_cache_estimated_items,
+            "Response cache initialized"
+        );
+        Some(cache)
+    };
 
     // Spawn background chain tracker with reorg callback (if database is configured)
     if let Some(db) = &validator_db {
@@ -295,12 +302,19 @@ async fn main() -> Result<()> {
             config,
             Some(move |reverted_hashes: &[B256]| {
                 if !reverted_hashes.is_empty() {
-                    tracing::info!(
-                        count = reverted_hashes.len(),
-                        "Invalidating response cache for reorged blocks"
-                    );
                     chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
-                    cache_for_reorg.invalidate_blocks(reverted_hashes);
+                    if let Some(cache) = &cache_for_reorg {
+                        tracing::info!(
+                            count = reverted_hashes.len(),
+                            "Invalidating response cache for reorged blocks"
+                        );
+                        cache.invalidate_blocks(reverted_hashes);
+                    } else {
+                        tracing::debug!(
+                            count = reverted_hashes.len(),
+                            "Reorg detected (response cache disabled)"
+                        );
+                    }
                 }
             }),
             Some(move |result: &validator_core::FetchResult| {
