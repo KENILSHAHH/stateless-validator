@@ -374,16 +374,15 @@ fn execute_transactions<E, T>(
 where
     E: BlockExecutor<Transaction = T>,
     E::Receipt: Encodable2718 + TxReceipt,
-    T: Clone,
     OpTransaction<T>: TransactionResponse,
     for<'a> Recovered<&'a T>: ExecutableTx<E>,
 {
     executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     for tx in transactions {
-        let tx_envelope = tx.inner.clone().into_inner();
-        let recovered_tx = Recovered::new_unchecked(&tx_envelope, tx.from());
-        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
+        executor
+            .execute_transaction(tx.inner.inner.as_recovered_ref())
+            .map_err(ValidationError::BlockReplayFailed)?;
     }
 
     let execution_result =
