@@ -94,7 +94,7 @@ where
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         trace!(?address, "basic_ref");
 
-        let raw_value = self.plain_value(&PlainKey::Account(address).encode())?;
+        let raw_value = self.plain_value(&PlainKey::encode_account(address))?;
 
         match raw_value.and_then(|v| match PlainValue::decode(&v) {
             PlainValue::Account(acc) => Some(acc),
@@ -130,7 +130,7 @@ where
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         trace!(?address, index = %format_args!("{:#x}", index), "storage_ref");
 
-        let raw_value = self.plain_value(&PlainKey::Storage(address, index.into()).encode())?;
+        let raw_value = self.plain_value(&PlainKey::encode_storage(address, index.into()))?;
 
         Ok(raw_value
             .and_then(|v| match PlainValue::decode(&v) {
@@ -292,11 +292,11 @@ impl SaltEnv for WitnessExternalEnv {
     }
 
     fn bucket_id_for_account(account: Address) -> BucketId {
-        hasher::bucket_id(&PlainKey::Account(account).encode())
+        hasher::bucket_id(&PlainKey::encode_account(account))
     }
 
     fn bucket_id_for_slot(address: Address, key: U256) -> BucketId {
-        hasher::bucket_id(&PlainKey::Storage(address, key.into()).encode())
+        hasher::bucket_id(&PlainKey::encode_storage(address, key.into()))
     }
 }
 

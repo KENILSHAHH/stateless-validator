@@ -71,6 +71,19 @@ impl PlainKey {
         }
     }
 
+    /// Encodes an account address into a stack-allocated 20-byte array.
+    pub fn encode_account(addr: Address) -> [u8; ACCOUNT_ADDRESS_LEN] {
+        addr.into_array()
+    }
+
+    /// Encodes an address + storage slot into a stack-allocated 52-byte array.
+    pub fn encode_storage(addr: Address, slot: B256) -> [u8; STORAGE_SLOT_KEY_LEN] {
+        let mut buf = [0u8; STORAGE_SLOT_KEY_LEN];
+        buf[..ACCOUNT_ADDRESS_LEN].copy_from_slice(addr.as_slice());
+        buf[ACCOUNT_ADDRESS_LEN..].copy_from_slice(slot.as_slice());
+        buf
+    }
+
     /// Decodes a byte slice into a PlainKey.
     ///
     /// Returns `PlainKey::Unknown` if the buffer length is neither 20 (account)
