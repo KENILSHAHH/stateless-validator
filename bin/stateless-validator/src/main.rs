@@ -15,16 +15,16 @@ use futures::future;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
-use tokio::{signal, task, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-use validator_core::{
+use stateless_core::{
     ChainSyncConfig, FetchResult, RpcClient, RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
     remote_chain_tracker,
 };
+use tokio::{signal, task, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 mod metrics;
 
@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
     shutdown_token.cancel();
 
     // Wait for background tasks to acknowledge cancellation and finish cleanly
-    let timeout = Duration::from_secs(1);
+    let timeout = Duration::from_secs(3);
     let bg_tasks_len = bg_tasks.len();
     match tokio::time::timeout(timeout, future::join_all(bg_tasks)).await {
         Ok(results) => {
@@ -253,7 +253,12 @@ async fn main() -> Result<()> {
                     Ok(Err(e)) => {
                         warn!(task_idx = i, error = %e, "[Main] Background task finished with error")
                     }
-                    Err(e) => warn!(task_idx = i, error = %e, "[Main] Background task panicked"),
+                    Err(e) if e.is_cancelled() => {
+                        debug!(task_idx = i, "[Main] Background task cancelled")
+                    }
+                    Err(e) => {
+                        error!(task_idx = i, error = %e, "[Main] Background task terminated unexpectedly")
+                    }
                     Ok(Ok(())) => {}
                 }
             }
@@ -593,7 +598,7 @@ async fn validate_one(
                 validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
             })
             .await
-            .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
+            .map_err(|e| eyre::eyre!("Validation task failed: {e}"))?;
 
             let (success, error_message) = match &validation_result {
                 Ok(stats) => {
@@ -810,8 +815,8 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
+    use stateless_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
     use tracing_subscriber::EnvFilter;
-    use validator_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
 
     use super::*;
 
