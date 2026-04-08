@@ -637,3 +637,138 @@ pub fn verify_block_integrity(block: &Block<OpTransaction>) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashMap},
+        fs::File,
+        io::{BufRead, BufReader},
+        path::Path,
+    };
+
+    use alloy_genesis::Genesis;
+    use alloy_primitives::BlockHash;
+    use alloy_rpc_types_eth::Block;
+    use op_alloy_rpc_types::Transaction;
+    use salt::SaltWitness;
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::{
+        chain_spec::ChainSpec,
+        database::{WitnessDatabase, WitnessExternalEnv},
+    };
+
+    const MAINNET_DATA_DIR: &str = "../../test_data/mainnet";
+
+    /// Witness file envelope containing the SALT witness and metadata.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct WitnessFileContent {
+        op_attributes_hash: B256,
+        parent_hash: BlockHash,
+        salt_witness: SaltWitness,
+    }
+
+    /// Load a block JSON file from the blocks directory.
+    fn load_block(path: impl AsRef<Path>) -> Block<Transaction> {
+        let data = std::fs::read(path.as_ref()).unwrap();
+        serde_json::from_slice(&data).unwrap()
+    }
+
+    /// Load contract bytecodes from a file (one `[hash, bytecode]` JSON per line).
+    fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
+        let file = File::open(path).expect("Failed to open contracts file");
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
+            .collect()
+    }
+
+    /// Load salt witness from a .salt file.
+    fn load_salt_witness(path: impl AsRef<Path>) -> SaltWitness {
+        let data = std::fs::read(path.as_ref()).unwrap();
+        let (content, _): (WitnessFileContent, usize) =
+            bincode::serde::decode_from_slice(&data, bincode::config::legacy()).unwrap();
+        content.salt_witness
+    }
+
+    /// Load chain spec from genesis.json.
+    fn load_chain_spec(path: impl AsRef<Path>) -> ChainSpec {
+        let data = std::fs::read(path.as_ref()).unwrap();
+        let genesis: Genesis = serde_json::from_slice(&data).unwrap();
+        ChainSpec::from_genesis(genesis)
+    }
+
+    /// Pick the first block that has witness data available.
+    fn find_first_witnessed_block()
+    -> (Block<Transaction>, SaltWitness, HashMap<B256, Bytecode>, ChainSpec) {
+        let block_dir = format!("{MAINNET_DATA_DIR}/blocks");
+        let witness_dir = format!("{MAINNET_DATA_DIR}/stateless/witness");
+
+        // Collect blocks sorted by number
+        let mut blocks: BTreeMap<u64, (BlockHash, String)> = BTreeMap::new();
+        for entry in std::fs::read_dir(&block_dir).unwrap() {
+            let file = entry.unwrap();
+            let name = file.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            if let Some(dot) = name.find('.') &&
+                let Ok(num) = name[..dot].parse::<u64>()
+            {
+                let block: Block<Transaction> = load_block(file.path());
+                let hash = BlockHash::from(block.header.hash);
+                blocks.insert(num, (hash, file.path().to_string_lossy().to_string()));
+            }
+        }
+
+        // Find first block with both salt witness
+        for (&_num, (hash, block_path)) in &blocks {
+            let hash_hex = format!("{hash:#x}");
+            let salt_path: Vec<_> = std::fs::read_dir(&witness_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.contains(&hash_hex[2..]) && n.ends_with(".salt")
+                })
+                .collect();
+
+            if let Some(salt) = salt_path.first() {
+                let block = load_block(block_path);
+                let salt_witness = load_salt_witness(salt.path());
+                let contracts = load_contracts(format!("{MAINNET_DATA_DIR}/contracts.txt"));
+                let chain_spec = load_chain_spec(format!("{MAINNET_DATA_DIR}/genesis.json"));
+                return (block, salt_witness, contracts, chain_spec);
+            }
+        }
+
+        panic!("No block with witness data found in {MAINNET_DATA_DIR}");
+    }
+
+    /// Tests that `execute_transactions` (called via `replay_block`) produces correct
+    /// receipts root, logs bloom, and gas used that match the block header.
+    ///
+    /// This validates the change from cloning transactions to using `as_recovered_ref()`.
+    #[test]
+    fn test_execute_transactions_output_matches_header() {
+        let (block, salt_witness, contracts, chain_spec) = find_first_witnessed_block();
+
+        let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number).unwrap();
+        let witness = salt::Witness::from(salt_witness);
+        witness.verify().unwrap();
+
+        let witness_db =
+            WitnessDatabase { header: &block.header, witness: &witness, contracts: &contracts };
+
+        let (_accounts, output) =
+            replay_block(&chain_spec, &block, &witness_db, ext_env, None).unwrap();
+
+        assert_eq!(output.receipts_root, block.header.receipts_root, "receipts root mismatch");
+        assert_eq!(output.logs_bloom, block.header.logs_bloom, "logs bloom mismatch");
+        assert_eq!(output.gas_used, block.header.gas_used, "gas used mismatch");
+    }
+}
