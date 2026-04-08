@@ -601,4 +601,38 @@ mod tests {
             .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
         }
     }
+
+    /// Verifies that `replay_block` (which exercises `execute_transactions`) produces
+    /// receipts root, logs bloom, and gas used that match the block header.
+    #[test]
+    fn replay_block_output_matches_header() {
+        let fx = TestFixtures::mainnet();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let paired = fx.paired_blocks();
+        let (_num, hash) = paired.first().expect("no paired mainnet fixtures");
+
+        let block = &fx.blocks[hash];
+        let salt_witness = fx.salt_witnesses[hash].clone();
+
+        let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number).unwrap();
+        let witness = salt::Witness::from(salt_witness);
+        witness.verify().unwrap();
+
+        let witness_db =
+            WitnessDatabase { header: &block.header, witness: &witness, contracts: &fx.contracts };
+
+        let (_accounts, output) = replay_block(
+            &chain_spec,
+            block,
+            &witness_db,
+            ext_env,
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.receipts_root, block.header.receipts_root, "receipts root mismatch");
+        assert_eq!(output.logs_bloom, block.header.logs_bloom, "logs bloom mismatch");
+        assert_eq!(output.gas_used, block.header.gas_used, "gas used mismatch");
+    }
 }
