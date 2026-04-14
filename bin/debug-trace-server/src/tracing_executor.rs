@@ -50,50 +50,30 @@ use revm::{
     DatabaseCommit, DatabaseRef,
     context::TxEnv,
     database::{CacheDB, State},
-    primitives::KECCAK_EMPTY,
     state::{Bytecode, EvmState},
 };
 use revm_inspectors::tracing::{
     FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
     js::JsInspector,
 };
-use tracing::{instrument, trace, warn};
-
-use crate::{
+use stateless_core::{
     chain_spec::ChainSpec,
-    data_types::{PlainKey, PlainValue},
-    database::{WitnessDatabase, WitnessExternalEnv},
+    data_types::iter_code_hashes,
+    evm_database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
+use tracing::{instrument, trace, warn};
 
-// ---------------------------------------------------------------------------
-// Helper Functions
-// ---------------------------------------------------------------------------
-
-/// Extracts all contract code hashes from a SALT witness.
+/// Returns distinct contract code hashes referenced by the witness, sorted for stable ordering.
 pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
-    let mut code_hashes: Vec<B256> = witness
-        .kvs
-        .values()
-        .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-            (PlainKey::Account(_), PlainValue::Account(acc)) => {
-                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
-            }
-            _ => None,
-        })
-        .collect();
-
+    let mut code_hashes: Vec<B256> = iter_code_hashes(&witness.kvs).collect();
     code_hashes.sort();
     code_hashes.dedup();
     code_hashes
 }
 
-// ---------------------------------------------------------------------------
 // TracerKind - Unified enum for TracingInspector-based tracers
-// ---------------------------------------------------------------------------
-
 /// Represents a tracer variant that uses `TracingInspector` under the hood.
 ///
 /// Unifies CallTracer, PreStateTracer, FlatCallTracer, and the default struct logger
@@ -120,10 +100,7 @@ impl TracerKind {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Fast Tracing Environment Setup (for LightWitness)
-// ---------------------------------------------------------------------------
-
 /// Pre-built execution environment for fast tracing operations.
 struct TracingEnv<'a> {
     transactions: &'a [OpTransaction],
@@ -231,10 +208,7 @@ macro_rules! replay_preceding_txs {
     };
 }
 
-// ---------------------------------------------------------------------------
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
-// ---------------------------------------------------------------------------
-
 /// Traces all transactions in a block using a `TracingInspector`-based tracer.
 ///
 /// Handles executor creation, pre-execution, tx loop, trace extraction, inspector
@@ -450,10 +424,7 @@ fn trace_tx_with_tracing_inspector(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Public API - Geth-style Tracing
-// ---------------------------------------------------------------------------
-
 /// Traces a block execution with detailed inspector data.
 ///
 /// Uses a **single executor** for all transactions to preserve the DynamicGasCost
@@ -887,10 +858,7 @@ pub fn trace_transaction(
     trace_tx_with_tracing_inspector(&env, block, &mut state, tx_index, &TracerKind::Default(opts))
 }
 
-// ---------------------------------------------------------------------------
 // Public API - Parity-style Tracing
-// ---------------------------------------------------------------------------
-
 /// Computes Parity-style traces for all transactions in a block using LightWitness.
 ///
 /// Uses a **single executor** for all transactions to preserve the DynamicGasCost
@@ -985,10 +953,7 @@ pub fn parity_trace_transaction(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Internal Helper
-// ---------------------------------------------------------------------------
-
 /// Adds accounts that were accessed but not modified to the prestate diff trace.
 ///
 /// In mega-reth, accounts that are accessed during transaction execution (e.g., fee recipients

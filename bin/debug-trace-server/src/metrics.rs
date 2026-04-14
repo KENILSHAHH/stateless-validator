@@ -13,10 +13,6 @@ use metrics_derive::Metrics;
 use metrics_exporter_prometheus::PrometheusBuilder;
 pub use stateless_common::DEFAULT_METRICS_PORT;
 
-// ---------------------------------------------------------------------------
-// RPC Method Name Constants
-// ---------------------------------------------------------------------------
-
 /// Prefix for timed RPC method aliases.
 pub const TIMED_PREFIX: &str = "timed_";
 
@@ -56,19 +52,12 @@ pub const TIMED_METHOD_ALIASES: &[(&str, &str)] = &[
     (TIMED_METHOD_TRACE_TRANSACTION, METHOD_TRACE_TRANSACTION),
 ];
 
-// ---------------------------------------------------------------------------
-// Cache Type Constants
-// ---------------------------------------------------------------------------
-
 /// Cache type for debug trace block responses.
 pub const CACHE_TYPE_DEBUG_TRACE: &str = "debug_trace_block";
 /// Cache type for parity trace block responses.
 pub const CACHE_TYPE_TRACE: &str = "trace_block";
 
-// ---------------------------------------------------------------------------
 // All known RPC methods (for resolving &str → &'static str)
-// ---------------------------------------------------------------------------
-
 const ALL_METHODS: &[&str] = &[
     METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
     METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
@@ -81,10 +70,6 @@ const ALL_METHODS: &[&str] = &[
 fn resolve_method(method: &str) -> &'static str {
     ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
 }
-
-// ---------------------------------------------------------------------------
-// ── Request Layer ──────────────────────────────
-// ---------------------------------------------------------------------------
 
 /// RPC method metrics with method label.
 #[derive(Clone, Metrics)]
@@ -181,10 +166,6 @@ impl CpuTimeMetrics {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ── Cache Layer ────────────────────────────────
-// ---------------------------------------------------------------------------
-
 /// Response cache metrics with cache type label.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -221,10 +202,6 @@ impl CacheMetrics {
         self.cache_bytes.set(data_bytes as f64);
     }
 }
-
-// ---------------------------------------------------------------------------
-// ── Data Fetch Layer ───────────────────────────
-// ---------------------------------------------------------------------------
 
 /// Tracks which source provided block data (cache/db/witness_generator/cloudflare).
 #[derive(Clone, Metrics)]
@@ -294,10 +271,6 @@ impl UpstreamMetrics {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ── Witness Layer ──────────────────────────────
-// ---------------------------------------------------------------------------
-
 /// Witness fetch metrics by source (witness_generator / cloudflare).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -333,10 +306,6 @@ impl WitnessSourceMetrics {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ── Execution Layer ────────────────────────────
-// ---------------------------------------------------------------------------
-
 /// EVM execution metrics with method label.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -360,18 +329,12 @@ impl EvmExecutionMetrics {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ── Infrastructure ─────────────────────────────
-// ---------------------------------------------------------------------------
-
 /// Chain sync metrics (singleton).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct ChainSyncMetrics {
     /// Depth of chain reorgs
     reorg_depth: Histogram,
-    /// Current remote chain height
-    remote_chain_height: Gauge,
     /// Duration of DB read operations in seconds
     db_read_duration_seconds: Histogram,
     /// Distance of requested block from chain tip
@@ -395,11 +358,6 @@ impl ChainSyncMetrics {
         self.reorg_depth.record(depth as f64);
     }
 
-    /// Sets the remote chain height.
-    pub fn set_remote_height(&self, height: u64) {
-        self.remote_chain_height.set(height as f64);
-    }
-
     /// Records a DB read duration.
     pub fn record_db_read(&self, duration_secs: f64) {
         self.db_read_duration_seconds.record(duration_secs);
@@ -421,10 +379,6 @@ impl ChainSyncMetrics {
         self.db_size_bytes.set(bytes as f64);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Pre-initialized Metric Instances
-// ---------------------------------------------------------------------------
 
 /// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
 fn pre_register_all_metrics() {
@@ -483,10 +437,6 @@ fn pre_register_all_metrics() {
     let _ = ChainSyncMetrics::create();
 }
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
-
 /// Initializes the Prometheus metrics exporter.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     PrometheusBuilder::new()
@@ -499,10 +449,6 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Backward-compatible helper functions
-// ---------------------------------------------------------------------------
 
 /// Strips the `timed_` prefix from a method name if present.
 pub fn strip_timed_prefix(method: &str) -> &str {
@@ -520,10 +466,6 @@ pub fn record_rpc_error(method: &str) {
     let method = resolve_method(strip_timed_prefix(method));
     RpcMethodMetrics::new_for_method(method).record_error();
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

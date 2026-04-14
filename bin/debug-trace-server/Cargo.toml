@@ -8,60 +8,64 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-
-# Ethereum types
+# alloy
+alloy-consensus.workspace = true
+alloy-evm.workspace = true
 alloy-genesis.workspace = true
+alloy-op-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
 
-# CLI
-clap.workspace = true
-
-# Concurrent map for single-flight
-dashmap = "5.5"
-
-# Error handling
-eyre.workspace = true
-http.workspace = true
-http-body.workspace = true
-# RPC framework
-jsonrpsee = { version = "0.24", features = ["server", "macros"] }
-libc = "0.2"
-metrics.workspace = true
-metrics-derive.workspace = true
-metrics-exporter-prometheus.workspace = true
-op-alloy-rpc-types.workspace = true
-pin-project-lite = "0.2"
-quick_cache = "0.6"
-
-# Execution
-revm.workspace = true
+# mega
+mega-evm.workspace = true
 salt.workspace = true
-serde.workspace = true
 
-# Serialization
-serde_json.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-tower = "0.4"
+# op
+op-alloy-network.workspace = true
+op-alloy-rpc-types.workspace = true
 
-# Logging and metrics
-tracing.workspace = true
+# revm
+revm.workspace = true
+revm-inspectors.workspace = true
 
-# Reuse stateless-core
+# stateless
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
 
+# misc
+clap.workspace = true
+dashmap.workspace = true
+eyre.workspace = true
+http.workspace = true
+http-body.workspace = true
+jsonrpsee.workspace = true
+libc.workspace = true
+metrics.workspace = true
+metrics-derive.workspace = true
+metrics-exporter-prometheus.workspace = true
+pin-project-lite.workspace = true
+quick_cache.workspace = true
+rayon.workspace = true
+redb.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-util.workspace = true
+tower.workspace = true
+tracing.workspace = true
+
 [dev-dependencies]
-alloy-consensus.workspace = true
-alloy-network = "1.0.23"
+alloy-network.workspace = true
 alloy-primitives.workspace = true
-bytes = "1"
-http-body-util = "0.1"
 
 # Transaction signing for integration tests
-alloy-signer-local = "1.0.23"
-dotenvy = "0.15"
+alloy-signer-local.workspace = true
+bytes.workspace = true
+dotenvy.workspace = true
+http-body-util.workspace = true
+
 # HTTP client for integration tests
-reqwest = { version = "0.12", features = ["json", "blocking"] }
-tempfile = "3.10"
+reqwest.workspace = true
+tempfile.workspace = true

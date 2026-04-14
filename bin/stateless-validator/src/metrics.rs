@@ -3,15 +3,18 @@
 //! Exposes metrics at `http://0.0.0.0:<port>/metrics` for Prometheus scraping.
 //! Enable via `--metrics-enabled --metrics-port 9090`.
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use alloy_primitives::B256;
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
-pub use stateless_common::DEFAULT_METRICS_PORT;
-pub use stateless_core::RpcMethod;
-use stateless_core::RpcMetrics;
+pub use stateless_common::{
+    DEFAULT_METRICS_PORT,
+    metrics::{RpcMethod, RpcMetrics},
+};
 use tracing::info;
 
 /// Metrics callback implementation for RPC client.
@@ -73,12 +76,9 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
-    // Database
+    // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
-    metric!(BLOCKS_PRUNED, "blocks_pruned_total");
-    metric!(DB_EARLIEST_BLOCK, "db_earliest_block");
-    metric!(DB_LATEST_BLOCK, "db_latest_block");
 
     // Witness
     metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
@@ -130,12 +130,9 @@ fn register_metric_descriptions() {
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
     describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
 
-    // Database
+    // Contract cache
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
-    describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
-    describe_gauge!(names::DB_EARLIEST_BLOCK, "Earliest block number in validator DB");
-    describe_gauge!(names::DB_LATEST_BLOCK, "Latest block number in validator DB");
 
     // Witness
     describe_histogram!(names::SALT_WITNESS_SIZE, "Salt witness size (bytes)");
@@ -195,15 +192,31 @@ pub fn on_worker_task_done(worker_id: usize, success: bool) {
 }
 
 // Chain metrics
-pub fn set_chain_heights(local: u64, remote: u64) {
-    gauge!(names::LOCAL_CHAIN_HEIGHT).set(local as f64);
-    gauge!(names::REMOTE_CHAIN_HEIGHT).set(remote as f64);
-    gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(local)) as f64);
+/// Tracks the latest known local and remote heights for lag computation.
+static LOCAL_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static REMOTE_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+fn update_lag() {
+    let local = LOCAL_HEIGHT.load(Ordering::Relaxed);
+    let remote = REMOTE_HEIGHT.load(Ordering::Relaxed);
+    gauge!(names::VALIDATION_LAG).set(remote.saturating_sub(local) as f64);
 }
 
-pub fn on_chain_reorg(reverted_hashes: &[B256]) {
+pub fn set_chain_height(local: u64) {
+    gauge!(names::LOCAL_CHAIN_HEIGHT).set(local as f64);
+    LOCAL_HEIGHT.store(local, Ordering::Relaxed);
+    update_lag();
+}
+
+pub fn set_remote_chain_height(remote: u64) {
+    gauge!(names::REMOTE_CHAIN_HEIGHT).set(remote as f64);
+    REMOTE_HEIGHT.store(remote, Ordering::Relaxed);
+    update_lag();
+}
+
+pub fn on_reorg(depth: u64) {
     counter!(names::REORGS_DETECTED).increment(1);
-    histogram!(names::REORG_DEPTH).record(reverted_hashes.len() as f64);
+    histogram!(names::REORG_DEPTH).record(depth as f64);
 }
 
 // RPC metrics
@@ -237,15 +250,6 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
     if misses > 0 {
         counter!(names::CONTRACT_CACHE_MISSES).increment(misses);
     }
-}
-
-pub fn on_blocks_pruned(count: u64) {
-    counter!(names::BLOCKS_PRUNED).increment(count);
-}
-
-pub fn set_db_block_range(earliest: u64, latest: u64) {
-    gauge!(names::DB_EARLIEST_BLOCK).set(earliest as f64);
-    gauge!(names::DB_LATEST_BLOCK).set(latest as f64);
 }
 
 /// Record witness fetch metrics.

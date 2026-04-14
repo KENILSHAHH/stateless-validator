@@ -1,45 +1,37 @@
 //! Stateless Validator Core Library
 //!
-//! This library provides the core functionality for stateless blockchain validation,
-//! including witness data handling, file I/O operations, and validation logic.
-//!
-//! ## Key Components
-//!
-//! - **BlockFileManager**: Centralized file management for validation, witness, and backup
-//!   operations
-//! - **Validation Logic**: Core validation algorithms for stateless operation
+//! Core building blocks for stateless block verification on MegaETH:
+//! EVM execution, SALT witness cryptography, a generic chain-sync pipeline,
+//! and the abstract storage / RPC traits that the rest of the workspace implements.
 //!
 //! ## Modules
 //!
-//! - [`database`]: Witness-backed database for REVM
-//! - [`data_types`]: EVM-specific data types and encoding utilities
-//! - [`executor`]: Block execution logic for replaying transactions
-//! - [`chain_sync`]: Chain synchronization utilities
+//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
+//! - [`executor`]: Block validation via EVM replay
+//! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
+//! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
+//! - [`rpc`]: `ChainDataProvider` trait for abstracting RPC access
+//! - [`chain_spec`]: Chain specification and hardfork activation
+//! - [`data_types`]: SALT key/value encoding utilities
+//! - [`light_witness`]: Fast witness deserialization (skips proof validation)
+//! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
 
 pub mod chain_spec;
-pub mod chain_sync;
 pub mod light_witness;
-pub use chain_sync::{
-    ChainSyncConfig, DEFAULT_METRICS_PORT, FetchResult, fetch_blocks_batch, remote_chain_tracker,
-};
 pub use light_witness::{LightWitness, LightWitnessExecutor};
-pub mod database;
-pub use database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
-pub mod validator_db;
-pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
+pub mod evm_database;
+pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
+pub mod db;
+pub use db::{BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore};
 pub mod data_types;
-pub use data_types::{PlainKey, PlainValue};
+pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
 pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
 };
-pub mod tracing_executor;
-pub use tracing_executor::{
-    extract_code_hashes, parity_trace_block, parity_trace_transaction, trace_block,
-    trace_transaction,
+pub mod pipeline;
+pub use pipeline::{
+    BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
+    ProcessedBlock, ReorgEvent, block_fetcher, find_divergence_point, run_pipeline,
 };
-pub mod rpc_client;
 pub mod withdrawals;
-pub use rpc_client::{
-    RpcClient, RpcClientConfig, RpcMethod, RpcMetrics, SetValidatedBlocksResponse,
-};
