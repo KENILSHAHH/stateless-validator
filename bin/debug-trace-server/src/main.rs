@@ -79,17 +79,29 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
     addr: String,
 
-    /// Upstream RPC endpoint URL.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT")]
-    rpc_endpoint: String,
+    /// One or more upstream RPC endpoint URLs for fetching blockchain data (tried in order).
+    /// Accepts repeated flags (`--rpc-endpoint a --rpc-endpoint b`) or a comma-separated
+    /// list (`--rpc-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    rpc_endpoint: Vec<String>,
 
-    /// Upstream witness endpoint URL.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT")]
-    witness_endpoint: String,
-
-    /// Optional Cloudflare witness endpoint URL for pruned/archived blocks.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_CLOUDFLARE_WITNESS_ENDPOINT")]
-    cloudflare_witness_endpoint: Option<String>,
+    /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
+    /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
+    /// list (`--witness-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    witness_endpoint: Vec<String>,
 
     /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
@@ -166,6 +178,16 @@ struct Args {
     )]
     pruner_interval_secs: u64,
 
+    /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
+    /// Omit for unlimited.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_DATA_MAX_CONCURRENT_REQUESTS")]
+    data_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
+    /// Omit for unlimited.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
+    witness_max_concurrent_requests: Option<usize>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -222,8 +244,8 @@ async fn main() -> Result<()> {
     );
     let response_cache_disabled = args.response_cache_estimated_items == 0;
     debug!(
-        rpc_endpoint = %args.rpc_endpoint,
-        witness_endpoint = %args.witness_endpoint,
+        rpc_endpoints = ?args.rpc_endpoint,
+        witness_endpoints = ?args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
         response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -246,13 +268,15 @@ async fn main() -> Result<()> {
     }
 
     // Initialize components
-    let rpc_client = Arc::new(RpcClient::new_with_config(
-        &args.rpc_endpoint,
-        &args.witness_endpoint,
-        RpcClientConfig::trace_server(),
-        args.cloudflare_witness_endpoint.as_deref(),
-        None,
-    )?);
+    let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
+    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: args.data_max_concurrent_requests,
+        witness_max_concurrent_requests: args.witness_max_concurrent_requests,
+        ..RpcClientConfig::trace_server()
+    };
+    let rpc_client =
+        Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
@@ -292,10 +316,10 @@ async fn main() -> Result<()> {
             ..PipelineConfig::default()
         });
         let processor = Arc::new(TraceProcessor);
-        let hooks = Arc::new(TraceHooks {
-            db: Arc::clone(db) as Arc<dyn BlockStore>,
-            response_cache: response_cache.clone(),
-        });
+        let hooks = Arc::new(TraceHooks::new(
+            Arc::clone(db) as Arc<dyn BlockStore>,
+            response_cache.clone(),
+        ));
         let fetcher = Arc::new(TraceFetcher { rpc_client: Arc::clone(&rpc_client) });
         task::spawn({
             let db = Arc::clone(db);
@@ -558,5 +582,110 @@ async fn history_pruner(
         }
 
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
+    /// ensuring container deployments configured purely via env are not silently limited
+    /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
+    fn assert_endpoint_accepts_multiple_forms(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(Args) -> Vec<String>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse =
+            |extra: &[&str]| extract(Args::try_parse_from(base.iter().chain(extra)).unwrap());
+
+        assert_eq!(parse(&[flag, "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(
+            parse(&[flag, "http://a,http://b", flag, "http://c"]),
+            ["http://a", "http://b", "http://c"],
+        );
+
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            env,
+            "http://a,http://b",
+            || parse(&[]),
+        );
+        assert_eq!(from_env, ["http://a", "http://b"]);
+    }
+
+    /// `--rpc-endpoint` accepts repeated flags and CSV values, both on the CLI and via env var,
+    /// mirroring `--witness-endpoint` behavior for multi-endpoint data RPC support.
+    #[test]
+    fn witness_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--witness-endpoint",
+            "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
+            &["debug-trace-server", "--rpc-endpoint", "http://rpc"],
+            |a| a.witness_endpoint,
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--rpc-endpoint",
+            "DEBUG_TRACE_SERVER_RPC_ENDPOINT",
+            &["debug-trace-server", "--witness-endpoint", "http://w"],
+            |a| a.rpc_endpoint,
+        );
+    }
+
+    /// Verifies a concurrency cap flag parses via CLI and env var, and defaults to `None`.
+    fn assert_concurrency_flag(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(Args) -> Option<usize>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse =
+            |extra: &[&str]| extract(Args::try_parse_from(base.iter().chain(extra)).unwrap());
+
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&[flag, "7"]), Some(7));
+
+        let from_env = stateless_test_utils::env::with_env_var(&guard, env, "12", || parse(&[]));
+        assert_eq!(from_env, Some(12));
+    }
+
+    #[test]
+    fn data_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--data-max-concurrent-requests",
+            "DEBUG_TRACE_SERVER_DATA_MAX_CONCURRENT_REQUESTS",
+            &[
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.data_max_concurrent_requests,
+        );
+    }
+
+    #[test]
+    fn witness_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--witness-max-concurrent-requests",
+            "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS",
+            &[
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.witness_max_concurrent_requests,
+        );
     }
 }

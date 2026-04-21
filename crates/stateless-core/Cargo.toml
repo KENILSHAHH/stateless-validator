@@ -42,7 +42,6 @@ revm.workspace = true
 # misc
 dyn-clone.workspace = true
 eyre.workspace = true
-futures.workspace = true
 kanal.workspace = true
 num_cpus.workspace = true
 rustc-hash.workspace = true
@@ -52,6 +51,13 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# misc
+bincode.workspace = true
+
+# stateless
+stateless-test-utils = { path = "../stateless-test-utils" }
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]

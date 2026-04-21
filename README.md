@@ -59,8 +59,12 @@ cargo run --release --bin stateless-validator -- \
 
 **Required Arguments:**
 - `--data-dir`: Directory for validator database and data files
-- `--rpc-endpoint`: JSON-RPC API endpoint URL to retrieve block data
-- `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL to retrieve witness data
+- `--rpc-endpoint`: JSON-RPC API endpoint URL(s) to retrieve block data.
+  Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure, with retry-with-backoff per provider).
+  The env var `STATELESS_VALIDATOR_RPC_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).
+- `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL(s) to retrieve witness data.
+  Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure).
+  The env var `STATELESS_VALIDATOR_WITNESS_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
@@ -166,7 +170,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
 
 ```
  Stage 1: FETCH          block_fetcher
-                          Pulls blocks + witnesses from RPC in parallel batches
+                          Streams blocks + witnesses from RPC via a bounded in-flight window
                           ↓ channel
  Stage 2: PROCESS        N workers × BlockProcessor
                           Validator: validate_block (EVM execution)
@@ -200,6 +204,8 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `crates/stateless-common/src/rpc_client.rs`   | RpcClient: HTTP-based block/witness/contract fetching                               |
 | `crates/stateless-common/src/db.rs`           | Shared redb table definitions and helpers                                           |
 | `crates/stateless-common/src/metrics.rs`      | RpcMethod, RpcMetrics, RpcClientConfig                                              |
+| `crates/stateless-common/src/witness_size.rs` | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
+| `crates/stateless-test-utils/src/fixtures.rs` | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
 | `bin/stateless-validator/src/chain_sync.rs`   | ValidatorFetcher, ValidatorProcessor, ValidatorHooks                                |
 | `bin/debug-trace-server/src/chain_sync.rs`    | TraceFetcher, TraceProcessor, TraceHooks                                            |
 | `bin/debug-trace-server/src/rpc_service.rs`   | RPC method definitions and handlers                                                 |
@@ -251,6 +257,7 @@ Metrics are available at `http://0.0.0.0:<port>/metrics`.
 | `stateless_validator_reorg_depth`                       | Histogram | Depth of chain reorganizations                      |
 | `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)            |
 | `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                    |
+| `stateless_validator_rpc_retry_attempts_total`          | Counter   | RPC transient retries (with `method` label)         |
 | `stateless_validator_contract_cache_hits_total`         | Counter   | Contract cache hits                                 |
 | `stateless_validator_contract_cache_misses_total`       | Counter   | Contract cache misses                               |
 

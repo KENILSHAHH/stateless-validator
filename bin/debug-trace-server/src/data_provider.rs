@@ -5,7 +5,6 @@
 //!
 //! 1. **Local Database** (fast) - Local DB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
-//! 3. **Cloudflare KV** (archive) - Optional fallback for pruned/old blocks (via RpcClient)
 //!
 //! # Features
 //! - **Single-flight request coalescing**: Prevents duplicate RPC calls for the same block
@@ -25,7 +24,7 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::RpcClient;
+use stateless_common::{RpcClient, estimate_witness_size};
 use stateless_core::{BlockStore, LightWitness, withdrawals::MptWitness};
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
@@ -70,14 +69,13 @@ type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 ///
 /// # Data Lookup Strategy
 /// 1. Check local database (if configured)
-/// 2. Fetch from remote RPC endpoints
-/// 3. Fall back to Cloudflare KV (if configured in RpcClient) for pruned blocks
+/// 2. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
 /// RPC call is made. Other requests subscribe to the result via broadcast channel.
 pub struct DataProvider {
-    /// RPC client for upstream data fetching (includes optional Cloudflare fallback).
+    /// RPC client for upstream data fetching (handles multi-endpoint fallback internally).
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).
     db: Option<Arc<dyn BlockStore>>,
@@ -91,7 +89,7 @@ impl DataProvider {
     /// Creates a new data provider.
     ///
     /// # Arguments
-    /// * `rpc_client` - RPC client for upstream data fetching (may include Cloudflare fallback)
+    /// * `rpc_client` - RPC client for upstream data fetching
     /// * `validator_db` - Optional local database for cached block data
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
@@ -99,10 +97,6 @@ impl DataProvider {
         db: Option<Arc<dyn BlockStore>>,
         witness_timeout_secs: u64,
     ) -> Self {
-        if rpc_client.has_cloudflare_provider() {
-            debug!("Cloudflare witness fallback enabled via RpcClient");
-        }
-
         Self {
             rpc_client,
             db,
@@ -445,131 +439,45 @@ impl DataProvider {
         Ok(BlockData { block, witness, contracts })
     }
 
-    /// Fetches witness data from Cloudflare KV via RpcClient.
-    ///
-    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
-    async fn get_witness_from_cloudflare(
-        &self,
-        block_number: u64,
-        block_hash: B256,
-    ) -> Result<(SaltWitness, MptWitness)> {
-        let cf_metrics = WitnessSourceMetrics::new_for_source("cloudflare");
-        let start = std::time::Instant::now();
-        match self.rpc_client.get_witness_from_cloudflare(block_number, block_hash).await {
-            Ok(result) => {
-                cf_metrics.record_request(true, start.elapsed().as_secs_f64());
-                cf_metrics.record_size(estimate_witness_size(&result.0, &result.1));
-                trace!(
-                    block_number,
-                    block_hash = %block_hash,
-                    "Witness fetched from Cloudflare"
-                );
-                Ok(result)
-            }
-            Err(e) => {
-                cf_metrics.record_request(false, start.elapsed().as_secs_f64());
-                warn!(
-                    block_number,
-                    block_hash = %block_hash,
-                    error = %e,
-                    "Cloudflare witness fetch failed"
-                );
-                Err(e)
-            }
-        }
-    }
-
-    /// Fetches witness data with height-based routing and fallback.
+    /// Fetches witness data with height-based routing.
     ///
     /// Routing logic:
-    /// - `block > db_max` → Retry witness endpoint (block is new, witness may be delayed), then
-    ///   Cloudflare fallback
-    /// - `block <= db_max` (or no DB) → Single witness attempt, then immediate Cloudflare fallback
-    ///   (block is old/pruned, no point retrying)
+    /// - `block > db_max` → Retry with timeout (block is new, witness may be delayed)
+    /// - `block <= db_max` (or no DB) → Single attempt per provider through all configured witness
+    ///   providers in order (block is old/pruned, no point waiting for a new witness)
     async fn fetch_witness_with_fallback(
         &self,
         block_number: u64,
         block_hash: B256,
     ) -> Result<(SaltWitness, MptWitness)> {
-        // Determine db_max_height if we have a database
         let db_max_height = self
             .db
             .as_ref()
             .and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
 
-        let is_new_block = match db_max_height {
-            Some(max) => block_number > max,
-            None => true, // No DB means treat all blocks as "new" (try witness endpoint with retry)
-        };
+        let is_new_block = db_max_height.is_none_or(|max| block_number > max);
 
         let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
+        let start = std::time::Instant::now();
 
-        if is_new_block {
-            // Block is newer than DB max: retry witness endpoint until timeout
-            trace!(
-                block_number,
-                db_max_height, "Block is new, using retry loop for witness endpoint"
-            );
-
-            let start = std::time::Instant::now();
-            match self.fetch_witness_with_retry(block_number, block_hash).await {
-                Ok(result) => {
-                    wg_metrics.record_request(true, start.elapsed().as_secs_f64());
-                    wg_metrics.record_size(estimate_witness_size(&result.0, &result.1));
-                    DataSourceMetrics::new_for_source("witness_generator").record();
-                    Ok(result)
-                }
-                Err(e) => {
-                    wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                    // Timeout reached, try Cloudflare fallback
-                    if self.rpc_client.has_cloudflare_provider() {
-                        trace!(
-                            block_number,
-                            %e,
-                            "Witness endpoint timeout, falling back to Cloudflare"
-                        );
-                        let result =
-                            self.get_witness_from_cloudflare(block_number, block_hash).await?;
-                        DataSourceMetrics::new_for_source("cloudflare").record();
-                        Ok(result)
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
+        let result = if is_new_block {
+            trace!(block_number, db_max_height, "Block is new, using retry loop for witness");
+            self.fetch_witness_with_retry(block_number, block_hash).await
         } else {
-            // Block is older/pruned: single attempt on witness endpoint, then immediate Cloudflare
-            trace!(
-                block_number,
-                db_max_height, "Block is old/pruned, single attempt then Cloudflare fallback"
-            );
+            trace!(block_number, db_max_height, "Block is old/pruned, single attempt");
+            self.rpc_client.get_witness(block_number, block_hash).await
+        };
 
-            let start = std::time::Instant::now();
-            match self.rpc_client.get_witness(block_number, block_hash).await {
-                Ok(result) => {
-                    wg_metrics.record_request(true, start.elapsed().as_secs_f64());
-                    wg_metrics.record_size(estimate_witness_size(&result.0, &result.1));
-                    DataSourceMetrics::new_for_source("witness_generator").record();
-                    Ok(result)
-                }
-                Err(e) => {
-                    wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                    // Single attempt failed, try Cloudflare fallback
-                    if self.rpc_client.has_cloudflare_provider() {
-                        trace!(
-                            block_number,
-                            %e,
-                            "Witness endpoint failed, falling back to Cloudflare"
-                        );
-                        let result =
-                            self.get_witness_from_cloudflare(block_number, block_hash).await?;
-                        DataSourceMetrics::new_for_source("cloudflare").record();
-                        Ok(result)
-                    } else {
-                        // No Cloudflare configured and witness fetch failed
-                        Err(eyre::eyre!("Block witness not found for block {}", block_number))
-                    }
-                }
+        match result {
+            Ok(w) => {
+                wg_metrics.record_request(true, start.elapsed().as_secs_f64());
+                wg_metrics.record_size(estimate_witness_size(&w.0, &w.1));
+                DataSourceMetrics::new_for_source("witness_generator").record();
+                Ok(w)
+            }
+            Err(e) => {
+                wg_metrics.record_request(false, start.elapsed().as_secs_f64());
+                Err(e)
             }
         }
     }
@@ -670,12 +578,7 @@ impl DataProvider {
 
         // Fetch missing contracts from RPC
         for hash in missing {
-            let code = self
-                .rpc_client
-                .get_code(hash)
-                .await
-                .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))?;
-            contracts.insert(hash, Bytecode::new_raw(code));
+            contracts.insert(hash, self.fetch_contract_code(hash).await?);
         }
 
         Ok(contracts)
@@ -691,27 +594,22 @@ impl DataProvider {
         trace!(count = code_hashes.len(), "Fetching contracts from RPC");
 
         for &hash in code_hashes {
-            let code = self
-                .rpc_client
-                .get_code(hash)
-                .await
-                .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))?;
-            result.insert(hash, Bytecode::new_raw(code));
+            result.insert(hash, self.fetch_contract_code(hash).await?);
         }
 
         Ok(result)
     }
-}
 
-/// Estimates the total size of witness data in bytes (approximate, avoids serialization).
-fn estimate_witness_size(salt: &SaltWitness, mpt: &MptWitness) -> usize {
-    // SaltKey (8 bytes) + Option<SaltValue> (~95 bytes) ≈ 103 bytes per entry
-    let salt_kvs_size = salt.kvs.len() * 103;
-    // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes each)
-    let proof_size = salt.proof.parents_commitments.len() * 64 + 576 + salt.proof.levels.len() * 5;
-    // MptWitness: storage_root (32 bytes) + sum of state bytes
-    let mpt_size = 32 + mpt.state.iter().map(|b| b.len()).sum::<usize>();
-    salt_kvs_size + proof_size + mpt_size
+    /// Fetches a single contract bytecode from upstream RPC and records upstream metrics.
+    async fn fetch_contract_code(&self, hash: B256) -> Result<Bytecode> {
+        let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
+        let start = std::time::Instant::now();
+        let result = self.rpc_client.get_code(hash).await;
+        upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
+        result
+            .map(Bytecode::new_raw)
+            .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))
+    }
 }
 
 #[cfg(test)]

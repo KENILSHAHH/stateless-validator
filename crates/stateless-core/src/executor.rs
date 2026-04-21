@@ -566,3 +566,34 @@ pub fn validate_block(
         salt_update_time,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use stateless_test_utils::fixtures::TestFixtures;
+
+    use super::*;
+
+    #[test]
+    fn validate_block_mainnet_fixtures() {
+        let fx = TestFixtures::mainnet();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        for (number, hash) in paired {
+            let (mpt, _): (MptWitness, _) = bincode::serde::decode_from_slice(
+                &fx.mpt_witness_bytes[&hash],
+                bincode::config::legacy(),
+            )
+            .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
+            validate_block(
+                &chain_spec,
+                &fx.blocks[&hash],
+                fx.salt_witnesses[&hash].clone(),
+                mpt,
+                &fx.contracts,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
+        }
+    }
+}

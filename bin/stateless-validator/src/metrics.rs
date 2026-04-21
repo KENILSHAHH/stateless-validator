@@ -10,10 +10,10 @@ use std::{
 
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
-    DEFAULT_METRICS_PORT,
-    metrics::{RpcMethod, RpcMetrics},
+    DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcMethod, RpcMetrics},
 };
 use tracing::info;
 
@@ -29,14 +29,12 @@ impl RpcMetrics for ValidatorMetrics {
         on_rpc_complete(method, success, duration_secs);
     }
 
-    fn on_witness_fetch(
-        &self,
-        salt_size: usize,
-        kvs_count: usize,
-        salt_kvs_size: usize,
-        mpt_size: usize,
-    ) {
-        on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+    fn on_rpc_retry(&self, method: RpcMethod) {
+        on_rpc_retry(method);
+    }
+
+    fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown) {
+        on_witness_fetch(breakdown);
     }
 }
 
@@ -72,6 +70,7 @@ pub mod names {
     // RPC
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
+    metric!(RPC_RETRY_ATTEMPTS_TOTAL, "rpc_retry_attempts_total");
     metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
@@ -87,9 +86,32 @@ pub mod names {
     metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_size_bytes");
 }
 
+/// State reads/writes per block (~ 10–5000 KV accesses).
+const COUNT_BUCKETS_5K: &[f64] =
+    &[1.0, 5.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
+
+/// SALT witness key count (~ 10–500 keys).
+const COUNT_BUCKETS_500: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0];
+
+/// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
+const BUCKET_SPECS: &[(&str, &[f64])] = &[
+    (names::BLOCK_STATE_READS, COUNT_BUCKETS_5K),
+    (names::BLOCK_STATE_WRITES, COUNT_BUCKETS_5K),
+    (names::SALT_WITNESS_KEYS, COUNT_BUCKETS_500),
+    (names::SALT_WITNESS_SIZE, BYTE_BUCKETS),
+    (names::SALT_WITNESS_KVS_SIZE, BYTE_BUCKETS),
+    (names::MPT_WITNESS_SIZE, BYTE_BUCKETS),
+    (names::REORG_DEPTH, REORG_DEPTH_BUCKETS),
+];
+
 /// Initialize the Prometheus metrics exporter at the given address.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    PrometheusBuilder::new()
+    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
         .with_http_listener(addr)
         .install()
         .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {}", e))?;
@@ -124,8 +146,15 @@ fn register_metric_descriptions() {
     describe_histogram!(names::REORG_DEPTH, "Reorg depth");
 
     // RPC
-    describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made");
-    describe_counter!(names::RPC_ERRORS_TOTAL, "RPC errors encountered");
+    describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made (one per logical call)");
+    describe_counter!(
+        names::RPC_ERRORS_TOTAL,
+        "RPC errors (final failures only, not retried attempts)"
+    );
+    describe_counter!(
+        names::RPC_RETRY_ATTEMPTS_TOTAL,
+        "RPC transient retry attempts (before final outcome)"
+    );
     describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
     describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
@@ -149,6 +178,7 @@ fn init_rpc_method_counters() {
         RpcMethod::EthGetBlockByNumber,
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
+        RpcMethod::EthGetTransactionByHash,
         RpcMethod::MegaGetBlockWitness,
         RpcMethod::MegaSetValidatedBlocks,
     ];
@@ -156,6 +186,7 @@ fn init_rpc_method_counters() {
         let method_str = method.as_str();
         counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(0);
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(0);
+        counter!(names::RPC_RETRY_ATTEMPTS_TOTAL, "method" => method_str).increment(0);
     }
 }
 
@@ -220,6 +251,10 @@ pub fn on_reorg(depth: u64) {
 }
 
 // RPC metrics
+pub fn on_rpc_retry(method: RpcMethod) {
+    counter!(names::RPC_RETRY_ATTEMPTS_TOTAL, "method" => method.as_str()).increment(1);
+}
+
 pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f64>) {
     let method_str = method.as_str();
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
@@ -253,9 +288,9 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
 }
 
 /// Record witness fetch metrics.
-pub fn on_witness_fetch(salt_size: usize, kvs_count: usize, salt_kvs_size: usize, mpt_size: usize) {
-    histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
-    histogram!(names::SALT_WITNESS_KEYS).record(kvs_count as f64);
-    histogram!(names::SALT_WITNESS_KVS_SIZE).record(salt_kvs_size as f64);
-    histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
+pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
+    histogram!(names::SALT_WITNESS_SIZE).record(b.salt_size as f64);
+    histogram!(names::SALT_WITNESS_KEYS).record(b.kvs_count as f64);
+    histogram!(names::SALT_WITNESS_KVS_SIZE).record(b.salt_kvs_size as f64);
+    histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
 }

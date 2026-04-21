@@ -112,6 +112,13 @@ impl BlockProcessor for TraceProcessor {
 pub struct TraceHooks {
     pub db: Arc<dyn BlockStore>,
     pub response_cache: Option<ResponseCache>,
+    pub chain_sync_metrics: metrics::ChainSyncMetrics,
+}
+
+impl TraceHooks {
+    pub fn new(db: Arc<dyn BlockStore>, response_cache: Option<ResponseCache>) -> Self {
+        Self { db, response_cache, chain_sync_metrics: metrics::ChainSyncMetrics::create() }
+    }
 }
 
 impl PipelineHooks for TraceHooks {
@@ -122,6 +129,11 @@ impl PipelineHooks for TraceHooks {
         self.db.store_block_data(&pairs)
     }
 
+    fn post_advance(&self, new_tip: &BlockMeta) -> eyre::Result<()> {
+        self.chain_sync_metrics.set_chain_height(new_tip.block_number);
+        Ok(())
+    }
+
     fn on_reorg(
         &self,
         _rollback_to: BlockNumber,
@@ -129,8 +141,7 @@ impl PipelineHooks for TraceHooks {
         reverted_hashes: &[BlockHash],
     ) -> eyre::Result<()> {
         if !reverted_hashes.is_empty() {
-            let chain_sync_metrics = metrics::ChainSyncMetrics::create();
-            chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
+            self.chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
             if let Some(cache) = &self.response_cache {
                 tracing::info!(
                     count = reverted_hashes.len(),
@@ -176,13 +187,13 @@ mod tests {
 
     #[test]
     fn test_trace_hooks_reorg_without_cache() {
-        let hooks = TraceHooks { db: Arc::new(MockBlockStore), response_cache: None };
+        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
         hooks.on_reorg(10, 2, &[Default::default()]).unwrap();
     }
 
     #[test]
     fn test_trace_hooks_stale_reset() {
-        let hooks = TraceHooks { db: Arc::new(MockBlockStore), response_cache: None };
+        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
     }
 

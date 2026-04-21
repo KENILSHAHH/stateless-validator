@@ -64,13 +64,29 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_DATA_DIR")]
     data_dir: String,
 
-    /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
-    #[clap(long, env = "STATELESS_VALIDATOR_RPC_ENDPOINT")]
-    rpc_endpoint: String,
+    /// One or more JSON-RPC API endpoints for fetching blockchain data (tried in order).
+    /// Accepts repeated flags (`--rpc-endpoint a --rpc-endpoint b`) or a comma-separated
+    /// list (`--rpc-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_RPC_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    rpc_endpoint: Vec<String>,
 
-    /// The URL of the MegaETH JSON-RPC API endpoint for fetching witness data.
-    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT")]
-    witness_endpoint: String,
+    /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
+    /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
+    /// list (`--witness-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    witness_endpoint: Vec<String>,
 
     /// Optional trusted block hash to start validation from.
     #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
@@ -95,6 +111,16 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
     metrics_port: u16,
 
+    /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
+    data_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
+    witness_max_concurrent_requests: Option<usize>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -108,8 +134,8 @@ async fn main() -> Result<()> {
     let start = Instant::now();
 
     info!(data_dir = %args.data_dir, "[Main] Data directory");
-    info!(rpc_endpoint = %args.rpc_endpoint, "[Main] RPC endpoint");
-    info!(witness_endpoint = %args.witness_endpoint, "[Main] Witness endpoint");
+    info!(rpc_endpoints = ?args.rpc_endpoint, "[Main] RPC endpoints");
+    info!(witness_endpoints = ?args.witness_endpoint, "[Main] Witness endpoints");
     if let Some(ref genesis_file) = args.genesis_file {
         info!(genesis_file, "[Main] Genesis file");
     }
@@ -125,12 +151,18 @@ async fn main() -> Result<()> {
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let rpc_config = RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: args.data_max_concurrent_requests,
+        witness_max_concurrent_requests: args.witness_max_concurrent_requests,
+        ..RpcClientConfig::validator()
+    }
+    .with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
+    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let client = Arc::new(RpcClient::new_with_config(
-        &args.rpc_endpoint,
-        &args.witness_endpoint,
+        &data_apis,
+        &witness_apis,
         rpc_config,
-        None, // No Cloudflare fallback for validator
         args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
@@ -363,6 +395,117 @@ mod tests {
         executor::validate_block, pipeline::run_pipeline, withdrawals::MptWitness,
     };
     use tracing_subscriber::EnvFilter;
+
+    /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
+    /// ensuring container deployments configured purely via env are not silently limited
+    /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
+    ///
+    /// `flag` is the CLI flag (e.g. `--rpc-endpoint`); `env` is the associated env var;
+    /// `base` is the other args needed for `try_parse_from` to succeed; `extract` pulls
+    /// the parsed `Vec<String>` out of `CommandLineArgs`.
+    fn assert_endpoint_accepts_multiple_forms(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(CommandLineArgs) -> Vec<String>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse = |extra: &[&str]| {
+            extract(CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap())
+        };
+
+        assert_eq!(parse(&[flag, "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(
+            parse(&[flag, "http://a,http://b", flag, "http://c"]),
+            ["http://a", "http://b", "http://c"],
+        );
+
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            env,
+            "http://a,http://b",
+            || parse(&[]),
+        );
+        assert_eq!(from_env, ["http://a", "http://b"]);
+    }
+
+    /// `--rpc-endpoint` accepts repeated flags and CSV values, both on the CLI and via env var,
+    /// mirroring `--witness-endpoint` behavior for multi-endpoint data RPC support.
+    #[test]
+    fn witness_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--witness-endpoint",
+            "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
+            &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"],
+            |a| a.witness_endpoint,
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--rpc-endpoint",
+            "STATELESS_VALIDATOR_RPC_ENDPOINT",
+            &["stateless-validator", "--data-dir", "/tmp/x", "--witness-endpoint", "http://w"],
+            |a| a.rpc_endpoint,
+        );
+    }
+
+    /// Verifies that a concurrency cap flag parses as `Some(n)` via CLI and env var,
+    /// and omission leaves the value `None` (unbounded).
+    fn assert_concurrency_flag(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(CommandLineArgs) -> Option<usize>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse = |extra: &[&str]| {
+            extract(CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap())
+        };
+
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&[flag, "7"]), Some(7));
+
+        let from_env = stateless_test_utils::env::with_env_var(&guard, env, "12", || parse(&[]));
+        assert_eq!(from_env, Some(12));
+    }
+
+    #[test]
+    fn data_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--data-max-concurrent-requests",
+            "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS",
+            &[
+                "stateless-validator",
+                "--data-dir",
+                "/tmp/x",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.data_max_concurrent_requests,
+        );
+    }
+
+    #[test]
+    fn witness_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--witness-max-concurrent-requests",
+            "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS",
+            &[
+                "stateless-validator",
+                "--data-dir",
+                "/tmp/x",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.witness_max_concurrent_requests,
+        );
+    }
 
     use super::*;
 
@@ -721,7 +864,7 @@ mod tests {
         let contract_cache =
             Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
         let (handle, url) = setup_mock_rpc_server(data).await;
-        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+        let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let chain_spec =
             Arc::new(load_or_create_chain_spec(&validator_db, Some(&genesis_file)).unwrap());

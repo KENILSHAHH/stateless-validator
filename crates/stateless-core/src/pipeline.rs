@@ -15,7 +15,7 @@
 //! [`run_pipeline`] orchestrates the full lifecycle.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     future::Future,
     sync::Arc,
@@ -24,8 +24,7 @@ use std::{
 
 use alloy_primitives::{BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
-use futures::future;
-use tokio::task::JoinHandle;
+use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -48,8 +47,8 @@ pub struct PipelineConfig {
     pub fetch_channel_capacity: usize,
     /// Channel capacity for the worker→advancer pipeline.
     pub result_channel_capacity: usize,
-    /// Number of blocks to fetch in parallel per batch.
-    pub fetcher_batch_size: usize,
+    /// Maximum number of in-flight block fetches.
+    pub fetcher_max_in_flight: usize,
     /// Maximum RPC retry backoff for the fetcher.
     pub fetcher_max_backoff: Duration,
     /// If local tip falls behind remote by more than this, reset anchor.
@@ -59,7 +58,8 @@ pub struct PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        let workers = num_cpus::get();
+        // Physical cores: workers are CPU-bound (EVM + IPA), hyperthreads don't help.
+        let workers = num_cpus::get_physical();
         Self {
             concurrent_workers: workers,
             sync_target: None,
@@ -67,7 +67,7 @@ impl Default for PipelineConfig {
             error_restart_delay: Duration::from_secs(1),
             fetch_channel_capacity: 2 * workers,
             result_channel_capacity: 2 * workers,
-            fetcher_batch_size: workers,
+            fetcher_max_in_flight: workers,
             fetcher_max_backoff: Duration::from_secs(30),
             stale_reset_threshold: None,
         }
@@ -331,10 +331,181 @@ where
     }
 }
 
-/// Continuously fetches blocks and sends them through a channel.
+/// Invariant: every block in `[base_block, next_block)` is in exactly one of
+/// `in_flight_blocks`, `sent`, or `failed`. All mutations go through the methods below.
+struct FetcherState<F: BlockFetcher> {
+    /// Lowest block not yet sent downstream.
+    base_block: u64,
+    /// Next block to spawn fresh.
+    next_block: u64,
+    tasks: JoinSet<(u64, Result<F::Output>)>,
+    /// Task id → block, for panic recovery (`JoinError` only carries the id).
+    task_to_block: HashMap<Id, u64>,
+    /// Mirror of `task_to_block.values()` for O(1) block-in-flight lookup.
+    in_flight_blocks: HashSet<u64>,
+    /// Successful blocks, waiting for `base_block` to catch up.
+    sent: HashSet<u64>,
+    /// Blocks awaiting retry.
+    failed: HashSet<u64>,
+    /// Per-block attempt count for log escalation (near-tip blocks often fail a few times).
+    error_counts: HashMap<u64, usize>,
+}
+
+impl<F: BlockFetcher> FetcherState<F> {
+    fn new(start_block: u64) -> Self {
+        Self {
+            base_block: start_block,
+            next_block: start_block,
+            tasks: JoinSet::new(),
+            task_to_block: HashMap::new(),
+            in_flight_blocks: HashSet::new(),
+            sent: HashSet::new(),
+            failed: HashSet::new(),
+            error_counts: HashMap::new(),
+        }
+    }
+
+    fn in_flight_len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn window_exhausted(&self, tip: u64) -> bool {
+        self.next_block > tip
+    }
+
+    /// Width of the outstanding fetch window — the memory bound for `sent` + in-flight + failed.
+    fn window_width(&self) -> u64 {
+        self.next_block - self.base_block
+    }
+
+    fn target_reached(&self, target: Option<u64>) -> bool {
+        target.is_some_and(|t| self.base_block > t)
+    }
+
+    fn next_past_target(&self, target: Option<u64>) -> bool {
+        target.is_some_and(|t| self.next_block > t)
+    }
+
+    fn spawn(&mut self, fetcher: &Arc<F>, bn: u64) {
+        let fetcher = fetcher.clone();
+        let span = info_span!("fetch_block", block_number = bn);
+        let handle =
+            self.tasks.spawn(async move { (bn, fetcher.fetch(bn).await) }.instrument(span));
+        self.task_to_block.insert(handle.id(), bn);
+        self.in_flight_blocks.insert(bn);
+    }
+
+    fn spawn_next(&mut self, fetcher: &Arc<F>) {
+        let bn = self.next_block;
+        self.spawn(fetcher, bn);
+        self.next_block += 1;
+    }
+
+    fn pop_failed(&mut self) -> Option<u64> {
+        let bn = *self.failed.iter().next()?;
+        self.failed.remove(&bn);
+        Some(bn)
+    }
+
+    fn on_success(&mut self, id: Id, bn: u64) {
+        self.task_to_block.remove(&id);
+        self.in_flight_blocks.remove(&bn);
+        self.error_counts.remove(&bn);
+        self.sent.insert(bn);
+    }
+
+    /// Returns the cumulative attempt count (for log escalation).
+    fn on_failure(&mut self, id: Id, bn: u64) -> usize {
+        self.task_to_block.remove(&id);
+        self.in_flight_blocks.remove(&bn);
+        self.failed.insert(bn);
+        let count = self.error_counts.entry(bn).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Re-enqueues the panicked task's block. Returns `None` if the id is unknown
+    /// (shouldn't happen — would leak the block from `in_flight_blocks`).
+    fn on_panic(&mut self, id: Id) -> Option<u64> {
+        let bn = self.task_to_block.remove(&id)?;
+        self.in_flight_blocks.remove(&bn);
+        self.failed.insert(bn);
+        Some(bn)
+    }
+
+    /// Drains the contiguous-sent prefix starting at `base_block`. In steady state this
+    /// keeps `sent` around `max_in_flight`; if `base_block` stalls on a persistently-
+    /// failing block, `sent` grows until the spawn-window cap (see `block_fetcher`) stops
+    /// further enqueues.
+    fn advance_base(&mut self) {
+        while self.sent.remove(&self.base_block) {
+            self.base_block += 1;
+        }
+    }
+
+    /// Defense in depth: re-enqueue any block in `[base_block, next_block)` that slipped
+    /// out of all three tracking sets. No-op under correct bookkeeping.
+    fn recover_gaps(&mut self) {
+        for bn in self.base_block..self.next_block {
+            if !self.sent.contains(&bn) &&
+                !self.in_flight_blocks.contains(&bn) &&
+                !self.failed.contains(&bn)
+            {
+                self.failed.insert(bn);
+            }
+        }
+    }
+}
+
+/// Cached chain tip with rate-limited refresh and failure backoff.
+struct TipTracker {
+    /// `None` forces a refresh (also keeps `start_block == 0` correct vs. a `0` sentinel).
+    latest: Option<u64>,
+    /// Rate-limits `latest_block_number()` calls (otherwise near-tip retries hammer
+    /// `eth_blockNumber` at 10+ RPS).
+    last_refresh: Instant,
+    backoff: Duration,
+}
+
+impl TipTracker {
+    fn new(poll_interval: Duration) -> Self {
+        Self {
+            latest: None,
+            last_refresh: Instant::now() - poll_interval,
+            backoff: Duration::from_secs(1),
+        }
+    }
+
+    fn value(&self) -> Option<u64> {
+        self.latest
+    }
+
+    fn refresh_due(&self, poll_interval: Duration) -> bool {
+        self.last_refresh.elapsed() >= poll_interval
+    }
+
+    fn set(&mut self, value: u64) {
+        self.latest = Some(value);
+        self.last_refresh = Instant::now();
+        self.backoff = Duration::from_secs(1);
+    }
+
+    fn backoff(&self) -> Duration {
+        self.backoff
+    }
+
+    fn inflate_backoff(&mut self, max: Duration) {
+        self.backoff = (self.backoff * 2).min(max);
+    }
+}
+
+/// Continuously fetches blocks and streams them through a channel.
 ///
-/// Calls [`BlockFetcher::fetch`] in parallel batches. Provides backpressure via
-/// bounded channel. On error, retries with exponential backoff.
+/// Spawns [`BlockFetcher::fetch`] calls onto a bounded [`JoinSet`] and forwards each result
+/// downstream as it completes — so a slow fetch does not delay faster ones in the same window.
+/// Results arrive out-of-order; [`chain_advancer`] reorders them via its `BTreeMap` buffer.
+/// Provides backpressure via the bounded output channel. On error, the block is re-enqueued;
+/// on repeated chain-tip lookup failure, backs off exponentially.
 pub async fn block_fetcher<F: BlockFetcher>(
     fetcher: Arc<F>,
     tx: kanal::Sender<F::Output>,
@@ -342,12 +513,17 @@ pub async fn block_fetcher<F: BlockFetcher>(
     config: Arc<PipelineConfig>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let tx = tx.to_async();
-    info!(start_block, batch_size = config.fetcher_batch_size, "[Fetcher] Starting");
+    /// Cap on `next_block - base_block`, as a multiple of `max_in_flight`. Bounds memory
+    /// when a persistently-failing block stalls `base_block` while the chain advances.
+    const FETCH_WINDOW_MULTIPLIER: u64 = 4;
 
-    let mut next_block = start_block;
-    let mut backoff = Duration::from_secs(1);
-    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
+    let tx = tx.to_async();
+    let max_in_flight = config.fetcher_max_in_flight;
+    let max_window = (max_in_flight as u64) * FETCH_WINDOW_MULTIPLIER;
+    info!(start_block, max_in_flight, max_window, "[Fetcher] Starting");
+
+    let mut state = FetcherState::<F>::new(start_block);
+    let mut tip = TipTracker::new(config.poll_interval);
 
     loop {
         if shutdown.is_cancelled() {
@@ -355,27 +531,54 @@ pub async fn block_fetcher<F: BlockFetcher>(
             return Ok(());
         }
 
-        if let Some(target) = config.sync_target &&
-            next_block > target
-        {
-            info!(target, "[Fetcher] Reached sync target, stopping");
+        if state.target_reached(config.sync_target) {
+            info!(target = ?config.sync_target, "[Fetcher] Reached sync target, stopping");
             return Ok(());
         }
 
-        let chain_latest = match fetcher.latest_block_number().await {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    _ = shutdown.cancelled() => return Ok(()),
+        // Refresh tip only when we've run past the cached value AND `poll_interval` has
+        // elapsed — the time gate alone would let retry-heavy loops hammer `eth_blockNumber`.
+        let window_exhausted = tip.value().is_none_or(|c| state.window_exhausted(c));
+        if window_exhausted && tip.refresh_due(config.poll_interval) {
+            match fetcher.latest_block_number().await {
+                Ok(n) => tip.set(n),
+                Err(e) => {
+                    warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(tip.backoff()) => {}
+                        _ = shutdown.cancelled() => return Ok(()),
+                    }
+                    tip.inflate_backoff(config.fetcher_max_backoff);
+                    continue;
                 }
-                backoff = (backoff * 2).min(config.fetcher_max_backoff);
-                continue;
             }
+        }
+        // No tip yet — can't proceed.
+        let Some(chain_latest) = tip.value() else {
+            tokio::select! {
+                _ = tokio::time::sleep(config.poll_interval) => {}
+                _ = shutdown.cancelled() => return Ok(()),
+            }
+            continue;
         };
 
-        if next_block > chain_latest {
+        // Retry failed blocks first, then fill remaining slots with fresh ones (bounded
+        // by window cap so a stalled block can't grow the collections indefinitely).
+        while state.in_flight_len() < max_in_flight &&
+            let Some(bn) = state.pop_failed()
+        {
+            state.spawn(&fetcher, bn);
+        }
+        while state.in_flight_len() < max_in_flight &&
+            state.next_block <= chain_latest &&
+            state.window_width() < max_window &&
+            !state.next_past_target(config.sync_target)
+        {
+            state.spawn_next(&fetcher);
+        }
+
+        if state.in_flight_len() == 0 {
+            // Caught up — wait for chain to advance.
             tokio::select! {
                 _ = tokio::time::sleep(config.poll_interval) => {}
                 _ = shutdown.cancelled() => return Ok(()),
@@ -383,65 +586,46 @@ pub async fn block_fetcher<F: BlockFetcher>(
             continue;
         }
 
-        let blocks_available = chain_latest - next_block + 1;
-        let batch_size = (config.fetcher_batch_size as u64).min(blocks_available);
+        // `_with_id` so a panicked task's `JoinError` maps back to its block number.
+        let joined = tokio::select! {
+            r = state.tasks.join_next_with_id() => r,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
 
-        debug!(next_block, batch_size, chain_latest, "[Fetcher] Fetching batch");
-
-        let fetch_start = Instant::now();
-        let results = future::join_all((next_block..next_block + batch_size).map(|block_number| {
-            let fetcher = fetcher.clone();
-            async move { fetcher.fetch(block_number).await }
-                .instrument(info_span!("fetch_block", block_number))
-        }))
-        .await;
-
-        // Send results in order, stop on first error
-        let mut fetched = 0u64;
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(item) => {
-                    block_error_counts.remove(&(next_block + i as u64));
-                    if tx.send(item).await.is_err() {
-                        info!("[Fetcher] Channel closed, stopping");
-                        return Ok(());
-                    }
-                    fetched += 1;
+        match joined {
+            Some(Ok((id, (bn, Ok(item))))) => {
+                state.on_success(id, bn);
+                if tx.send(item).await.is_err() {
+                    info!("[Fetcher] Channel closed, stopping");
+                    return Ok(());
                 }
-                Err(e) => {
-                    let block_number = next_block + i as u64;
-                    let count = block_error_counts.entry(block_number).or_insert(0);
-                    *count += 1;
-                    // Near-tip blocks routinely fail for the first few attempts while
-                    // the witness is being generated; stay silent until attempt 4,
-                    // then warn, and escalate to error after repeated failures.
-                    if (4..=5).contains(count) {
-                        warn!(block_number, attempt = *count, error = %e, "[Fetcher] Block fetch error");
-                    } else if *count > 5 {
-                        error!(block_number, attempt = *count, error = %e, "[Fetcher] Block fetch error (repeated)");
-                    }
-                    break;
+                debug!(block_number = bn, "[Fetcher] Block sent to pipeline");
+            }
+            Some(Ok((id, (bn, Err(e))))) => {
+                // Near-tip blocks routinely fail while the witness is being generated;
+                // stay quiet for the first few attempts, then escalate.
+                let attempt = state.on_failure(id, bn);
+                if (4..=5).contains(&attempt) {
+                    warn!(block_number = bn, attempt, error = %e, "[Fetcher] Block fetch error");
+                } else if attempt > 5 {
+                    error!(block_number = bn, attempt, error = %e, "[Fetcher] Block fetch error (repeated)");
                 }
+            }
+            Some(Err(join_err)) => {
+                let id = join_err.id();
+                if let Some(bn) = state.on_panic(id) {
+                    error!(block_number = bn, error = %join_err, "[Fetcher] Fetch task panicked, re-enqueueing");
+                } else {
+                    error!(error = %join_err, "[Fetcher] Fetch task panicked with unknown task id");
+                }
+            }
+            None => {
+                // JoinSet drained unexpectedly — tolerable; loop will refill.
             }
         }
 
-        if fetched > 0 {
-            debug!(
-                blocks = fetched,
-                start = next_block,
-                end = next_block + fetched - 1,
-                ms = fetch_start.elapsed().as_millis() as u64,
-                "[Fetcher] Batch sent to pipeline"
-            );
-            next_block += fetched;
-            backoff = Duration::from_secs(1);
-        } else {
-            tokio::select! {
-                _ = tokio::time::sleep(backoff) => {}
-                _ = shutdown.cancelled() => return Ok(()),
-            }
-            backoff = (backoff * 2).min(config.fetcher_max_backoff);
-        }
+        state.advance_base();
+        state.recover_gaps();
     }
 }
 
@@ -723,11 +907,11 @@ mod tests {
     #[test]
     fn test_pipeline_config_default_uses_cpu_count() {
         let config = PipelineConfig::default();
-        let cpus = num_cpus::get();
+        let cpus = num_cpus::get_physical();
         assert_eq!(config.concurrent_workers, cpus);
         assert_eq!(config.fetch_channel_capacity, 2 * cpus);
         assert_eq!(config.result_channel_capacity, 2 * cpus);
-        assert_eq!(config.fetcher_batch_size, cpus);
+        assert_eq!(config.fetcher_max_in_flight, cpus);
     }
 
     #[test]
@@ -1128,5 +1312,137 @@ mod tests {
         assert_eq!(msg, "boom");
         // Default error_action is Halt
         assert_eq!(action, ErrorAction::Halt);
+    }
+
+    /// Streaming regression: with the previous `join_all` batching all 4 blocks in a batch
+    /// completed together, so a slow block held everyone back. With `JoinSet` streaming, the
+    /// 3 fast blocks must be sent downstream before the slow one.
+    #[tokio::test]
+    async fn test_block_fetcher_streams_out_of_order() {
+        /// Returns `block_number` as Output; delays exactly `slow_block` by `slow_delay`.
+        struct SlowFetcher {
+            latest: u64,
+            slow_block: u64,
+            slow_delay: Duration,
+        }
+
+        impl BlockFetcher for SlowFetcher {
+            type Output = u64;
+            async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+                if bn == self.slow_block {
+                    tokio::time::sleep(self.slow_delay).await;
+                }
+                Ok(bn)
+            }
+            async fn latest_block_number(&self) -> eyre::Result<u64> {
+                Ok(self.latest)
+            }
+            async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
+                unreachable!()
+            }
+            async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
+                unreachable!()
+            }
+        }
+
+        let (start, slow) = (100u64, 102u64);
+        let fetcher = Arc::new(SlowFetcher {
+            latest: start + 3,
+            slow_block: slow,
+            slow_delay: Duration::from_millis(200),
+        });
+        let (tx, rx) = kanal::bounded::<u64>(8);
+        let config = Arc::new(PipelineConfig {
+            fetcher_max_in_flight: 4,     // window holds all 4 blocks
+            sync_target: Some(start + 3), // fetcher exits cleanly after block 103
+            poll_interval: Duration::from_millis(10),
+            ..PipelineConfig::default()
+        });
+        let handle =
+            tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
+
+        // First 3 results must be the fast blocks (slow block must NOT be among them).
+        let rx = rx.to_async();
+        let recv = async || {
+            tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.unwrap().unwrap()
+        };
+        let mut first_three = [recv().await, recv().await, recv().await];
+        first_three.sort();
+        assert_eq!(first_three, [start, start + 1, start + 3], "streaming broken: {first_three:?}");
+
+        // The 4th (final) result is the slow block.
+        let last =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(last, slow);
+
+        // Fetcher exits cleanly after sync_target.
+        assert!(tokio::time::timeout(Duration::from_secs(1), handle).await.is_ok());
+    }
+
+    /// Regression: a persistently-failing block must not let the fetch window grow
+    /// unboundedly while the chain advances. The spawn-window cap bounds the highest
+    /// block we ever attempt to `stuck + max_window - 1` (since `base_block` can reach
+    /// `stuck` itself via contiguous-sent drain below it).
+    #[tokio::test]
+    async fn test_block_fetcher_bounded_window_under_stall() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Fails block `stuck`; records the highest `bn` ever requested.
+        struct StallFetcher(u64, u64, Arc<AtomicU64>); // (latest, stuck, highest)
+
+        impl BlockFetcher for StallFetcher {
+            type Output = u64;
+            async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+                self.2.fetch_max(bn, Ordering::Relaxed);
+                if bn == self.1 { Err(eyre::eyre!("stuck")) } else { Ok(bn) }
+            }
+            async fn latest_block_number(&self) -> eyre::Result<u64> {
+                Ok(self.0)
+            }
+            async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
+                unreachable!()
+            }
+            async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
+                unreachable!()
+            }
+        }
+
+        let (start, stuck, latest) = (100u64, 105u64, 10_100u64);
+        let max_in_flight = 4;
+        let max_window = 4 * max_in_flight as u64; // matches FETCH_WINDOW_MULTIPLIER
+        let highest = Arc::new(AtomicU64::new(0));
+
+        let (tx, rx) = kanal::bounded::<u64>(1024);
+        let config = Arc::new(PipelineConfig {
+            fetcher_max_in_flight: max_in_flight,
+            poll_interval: Duration::from_millis(10),
+            ..PipelineConfig::default()
+        });
+        let shutdown = CancellationToken::new();
+
+        // Drain so `tx.send` never blocks — isolate the window cap as the sole limiter.
+        let drain = tokio::spawn(async move {
+            let rx = rx.to_async();
+            while rx.recv().await.is_ok() {}
+        });
+        let fetcher = tokio::spawn(block_fetcher(
+            Arc::new(StallFetcher(latest, stuck, highest.clone())),
+            tx,
+            start,
+            config,
+            shutdown.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), fetcher).await;
+        drain.abort();
+
+        let h = highest.load(Ordering::Relaxed);
+        let ceiling = stuck + max_window;
+        assert!(
+            h < ceiling,
+            "attempted {h}, expected < {ceiling}; without cap would reach ~{latest}"
+        );
     }
 }
