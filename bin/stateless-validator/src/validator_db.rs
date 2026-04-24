@@ -6,89 +6,103 @@
 //! CANONICAL_CHAIN is bounded to `max_chain_length` entries; older entries are
 //! pruned inline during [`ChainStore::advance_chain`].
 
-use std::{collections::HashMap, path::Path, sync::atomic::AtomicU64};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::ReadableDatabase;
 use revm::state::Bytecode;
-use stateless_common::db::{
-    ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
-    db_add_contracts, db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
-    db_get_earliest_block, db_reset_to_anchor, db_rollback_chain,
+use stateless_core::db::{
+    BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult, StoreResultExt,
 };
-use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore};
+use stateless_db::{
+    ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
+    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
+    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
+};
 
 /// Minimal persistent storage backed by redb.
 pub struct ValidatorDB {
     database: Database,
-    max_chain_length: AtomicU64,
+    /// Soft cap on the number of rows retained in `CANONICAL_CHAIN`. Oldest rows are pruned
+    /// inline during `advance_chain` when the table exceeds this.
+    max_chain_length: u64,
 }
 
 impl ValidatorDB {
-    /// Creates or opens a persistent store at the given path.
-    pub fn new(db_path: impl AsRef<Path>) -> eyre::Result<Self> {
-        let database = Database::create(db_path)?;
+    /// Creates or opens a persistent store at the given path, using [`DEFAULT_MAX_CHAIN_LENGTH`]
+    /// as the canonical-chain retention cap. Use [`ValidatorDB::with_max_chain_length`] to
+    /// override the cap.
+    pub fn new(db_path: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::with_max_chain_length(db_path, DEFAULT_MAX_CHAIN_LENGTH)
+    }
+
+    /// Creates or opens a persistent store at the given path with an explicit
+    /// canonical-chain retention cap.
+    pub fn with_max_chain_length(
+        db_path: impl AsRef<Path>,
+        max_chain_length: u64,
+    ) -> StoreResult<Self> {
+        let database = Database::create(db_path).store_err()?;
 
         // Initialize all tables
-        let write_txn = database.begin_write()?;
+        let write_txn = database.begin_write().store_err()?;
         {
-            let _ = write_txn.open_table(ANCHOR_BLOCK)?;
-            let _ = write_txn.open_table(CONTRACTS)?;
-            let _ = write_txn.open_table(GENESIS_CONFIG)?;
-            let _ = write_txn.open_table(CANONICAL_CHAIN)?;
+            let _ = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            let _ = write_txn.open_table(CONTRACTS).store_err()?;
+            let _ = write_txn.open_table(GENESIS_CONFIG).store_err()?;
+            let _ = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
 
-        Ok(Self { database, max_chain_length: AtomicU64::new(DEFAULT_MAX_CHAIN_LENGTH) })
+        Ok(Self { database, max_chain_length })
     }
 
     #[cfg(test)]
-    fn set_max_chain_length(&self, max: u64) {
-        self.max_chain_length.store(max, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn set_anchor_block(&self, tip: &BlockMeta) -> eyre::Result<()> {
-        use stateless_common::db::block_meta_to_tuple;
-        let write_txn = self.database.begin_write()?;
+    fn set_anchor_block(&self, tip: &BlockMeta) -> StoreResult<()> {
+        use stateless_db::block_meta_to_tuple;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut table = write_txn.open_table(ANCHOR_BLOCK)?;
-            table.insert("anchor", block_meta_to_tuple(tip))?;
+            let mut table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            table.insert("anchor", block_meta_to_tuple(tip)).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 }
 
 impl ContractStore for ValidatorDB {
-    fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        db_get_contracts(&self.database, hashes)
+    fn get_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+        read_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
-        db_add_contracts(&self.database, codes)
+    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+        write_add_contracts(&self.database, codes)
     }
 }
 
 impl GenesisStore for ValidatorDB {
-    fn store_genesis(&self, genesis: &Genesis) -> eyre::Result<()> {
-        let json_bytes = serde_json::to_vec(genesis)?;
-        let write_txn = self.database.begin_write()?;
+    fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()> {
+        let json_bytes = serde_json::to_vec(genesis).store_err()?;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut table = write_txn.open_table(GENESIS_CONFIG)?;
-            table.insert("genesis", json_bytes)?;
+            let mut table = write_txn.open_table(GENESIS_CONFIG).store_err()?;
+            table.insert("genesis", json_bytes).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 
-    fn load_genesis(&self) -> eyre::Result<Option<Genesis>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(GENESIS_CONFIG)?;
-        match table.get("genesis")? {
+    fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
+        let read_txn = self.database.begin_read().store_err()?;
+        let table = read_txn.open_table(GENESIS_CONFIG).store_err()?;
+        match table.get("genesis").store_err()? {
             Some(data) => {
-                let genesis: Genesis = serde_json::from_slice(data.value().as_slice())?;
+                let genesis: Genesis =
+                    serde_json::from_slice(data.value().as_slice()).store_err()?;
                 Ok(Some(genesis))
             }
             None => Ok(None),
@@ -97,61 +111,34 @@ impl GenesisStore for ValidatorDB {
 }
 
 impl ChainStore for ValidatorDB {
-    fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_canonical_tip(&self.database)
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+        read_canonical_tip(&self.database)
     }
 
-    fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_anchor(&self.database)
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+        read_anchor(&self.database)
     }
 
-    fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let max_len = self.max_chain_length.load(std::sync::atomic::Ordering::Relaxed);
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            for block in blocks {
-                chain.insert(
-                    block.block_number,
-                    (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
-                )?;
-            }
-
-            // Inline pruning: remove oldest entries that exceed the max chain length
-            let len = chain.len()?;
-            if len > max_len {
-                let excess = len - max_len;
-                let to_remove: Vec<u64> = chain
-                    .iter()?
-                    .take(excess as usize)
-                    .map(|r| r.map(|(k, _)| k.value()))
-                    .collect::<std::result::Result<_, _>>()?;
-                for n in to_remove {
-                    chain.remove(n)?;
-                }
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+    fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
+        // Delegate to the shared helper; validator applies its retention cap inline,
+        // so the helper does the pruning in the same write transaction as the insert.
+        write_advance_chain(&self.database, blocks, Some(self.max_chain_length))
     }
 
-    fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
-        db_get_block_hash(&self.database, block_number)
+    fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        read_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
-        db_get_earliest_block(&self.database)
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        read_earliest_block(&self.database)
     }
 
-    fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
-        db_rollback_chain(&self.database, to_block)
+    fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
+        write_rollback_chain(&self.database, to_block)
     }
 
-    fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        db_reset_to_anchor(&self.database, anchor)
+    fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
+        write_reset_to_anchor(&self.database, anchor)
     }
 }
 
@@ -159,7 +146,7 @@ impl ChainStore for ValidatorDB {
 mod tests {
     use std::sync::Arc;
 
-    use stateless_common::db::ContractCache;
+    use stateless_db::ContractCache;
 
     use super::*;
 
@@ -228,8 +215,10 @@ mod tests {
         let hash2 = B256::from([2u8; 32]);
         let hash3 = B256::from([3u8; 32]);
 
-        let bytecode1 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
-        let bytecode2 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01]));
+        let bytecode1 =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
+        let bytecode2 =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01])));
 
         store.add_contracts(&[(hash1, bytecode1.clone()), (hash2, bytecode2.clone())]).unwrap();
 
@@ -281,7 +270,8 @@ mod tests {
         let cache = ContractCache::new(Arc::new(store));
 
         let hash = B256::from([1u8; 32]);
-        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let bytecode =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
 
         cache.insert(&[(hash, bytecode.clone())]).unwrap();
 
@@ -297,7 +287,8 @@ mod tests {
         let db_path = dir.path().join("test.redb");
 
         let hash = B256::from([1u8; 32]);
-        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let bytecode =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
 
         {
             let store = ValidatorDB::new(&db_path).unwrap();
@@ -366,8 +357,8 @@ mod tests {
 
     #[test]
     fn test_advance_chain_inline_pruning() {
-        let (_dir, store) = temp_store();
-        store.set_max_chain_length(5);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), 5).unwrap();
 
         let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
         ChainStore::advance_chain(&store, &blocks).unwrap();

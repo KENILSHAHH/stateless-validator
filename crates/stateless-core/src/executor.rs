@@ -27,6 +27,7 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     io::Write,
+    sync::Arc,
     time::{Instant, SystemTime},
 };
 
@@ -300,7 +301,7 @@ where
 
     let hardfork = chain_spec.hardfork(block.header.timestamp);
     debug!(
-        "[Replay Block] block_number={}, block_hash={:?}, hardfork={:?}",
+        "Replay block: block_number={}, block_hash={:?}, hardfork={:?}",
         block.header.number, block.header.hash, hardfork
     );
     let block_limits = if let Some(hardfork) = hardfork {
@@ -425,7 +426,7 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &std::collections::HashMap<B256, Bytecode>,
+    contracts: &std::collections::HashMap<B256, Arc<Bytecode>>,
     writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness

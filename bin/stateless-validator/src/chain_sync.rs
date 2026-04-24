@@ -9,11 +9,10 @@ use std::{collections::HashSet, sync::Arc};
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, ensure};
-use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::{RpcClient, db::ContractCache};
+use stateless_common::RpcClient;
 use stateless_core::{
     chain_spec::ChainSpec,
     data_types::iter_code_hashes,
@@ -22,6 +21,7 @@ use stateless_core::{
     pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks, ProcessedBlock},
     withdrawals::MptWitness,
 };
+use stateless_db::ContractCache;
 use tokio::task;
 use tracing::{debug, error};
 
@@ -38,25 +38,30 @@ impl BlockFetcher for ValidatorFetcher {
     type Output = ValidationTask;
 
     async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
-        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
-        let (salt_witness, mpt_witness) =
-            self.rpc_client.get_witness(block_number, block_hash).await?;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
+        let block_hash = self.rpc_client.get_block_hash(block_number).await;
+        // Once we have the hash, fetch the witness and the full block concurrently — they
+        // hit independent upstreams (witness providers vs. data providers) and both retry
+        // internally, so `tokio::join!` just overlaps the two round-trips. Matches the
+        // pattern used by `DataProvider::do_fetch_block_data` in the trace server.
+        let ((salt_witness, mpt_witness), block) = tokio::join!(
+            self.rpc_client.get_witness(block_number, block_hash),
+            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+        );
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
-        let n = self.rpc_client.get_latest_block_number().await?;
+        let n = self.rpc_client.get_latest_block_number().await;
         (self.on_remote_height)(n);
         Ok(n)
     }
 
     async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
-        self.rpc_client.get_block_hash(block_number).await
+        Ok(self.rpc_client.get_block_hash(block_number).await)
     }
 
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
-        let header = self.rpc_client.get_header(BlockId::latest(), false).await?;
+        let header = self.rpc_client.get_header(BlockId::latest(), false).await;
         Ok(BlockMeta {
             block_number: header.number,
             block_hash: header.hash,
@@ -128,7 +133,8 @@ impl ProcessedBlock for ValidatedBlock {
 }
 
 /// Validation failure sent from worker to advancer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Block {block_number} ({block_hash}) validation failed: {error}")]
 pub struct ValidationFailure {
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
@@ -136,16 +142,6 @@ pub struct ValidationFailure {
     /// `true` for transient errors (RPC timeout) that are worth retrying.
     /// `false` for deterministic failures (validation mismatch) that should halt.
     pub transient: bool,
-}
-
-impl std::fmt::Display for ValidationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Block {} ({}) validation failed: {}",
-            self.block_number, self.block_hash, self.error
-        )
-    }
 }
 
 /// Block processor for the validator: validates blocks using EVM execution.
@@ -177,38 +173,32 @@ impl BlockProcessor for ValidatorProcessor {
             transient,
         };
 
-        // Resolve contract codes
-        let codehashes: HashSet<B256> = iter_code_hashes(&task.salt_witness.kvs).collect();
+        // Resolve contract codes via the shared three-tier chain. Memory/disk hits
+        // are trusted; the RPC tier verifies each bytecode's hash inside `get_codes`.
+        let codehashes: Vec<B256> =
+            iter_code_hashes(&task.salt_witness.kvs).collect::<HashSet<_>>().into_iter().collect();
         let (mut contracts, missing_contracts) = self
             .contract_cache
-            .get(&codehashes.iter().copied().collect::<Vec<_>>())
+            .get(&codehashes)
             .map_err(|e| fail(format!("Failed to get contracts: {e}"), true))?;
 
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            let client = self.rpc_client.clone();
-            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| {
-                let client = client.clone();
-                async move { client.get_code(hash).await }
-            }))
-            .await
-            .map_err(|e| fail(format!("Failed to fetch contracts: {e}"), true))?;
+            // The unbounded `get_codes` retries transport errors forever, so the only way this
+            // errors is `VerificationFailure` — a deterministic bad upstream / bad witness.
+            // The `Deadline` variant can't surface here because no deadline is passed.
+            let fetched =
+                self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
+                    stateless_common::CodeFetchError::VerificationFailure { .. } => {
+                        fail(format!("Contract verification failed: {e}"), false)
+                    }
+                    stateless_common::CodeFetchError::Deadline(_) => {
+                        unreachable!("unbounded get_codes cannot produce a deadline error: {e}")
+                    }
+                })?;
 
-            let new_bytecodes: Vec<_> = missing_contracts
-                .into_iter()
-                .zip(codes.iter())
-                .map(|(code_hash, bytes)| {
-                    let bytecode = Bytecode::new_raw(bytes.clone());
-                    let computed_hash = bytecode.hash_slow();
-                    ensure!(
-                        computed_hash == code_hash,
-                        "RPC provider returned bytecode with unexpected codehash: expected {code_hash:?}, got {computed_hash:?}",
-                    );
-                    Ok((computed_hash, bytecode))
-                })
-                .collect::<eyre::Result<_>>()
-                .map_err(|e| fail(format!("Contract hash mismatch: {e}"), false))?;
+            let new_bytecodes: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 
             self.contract_cache
                 .insert(&new_bytecodes)
@@ -248,7 +238,7 @@ impl BlockProcessor for ValidatorProcessor {
 
         match &validation_result {
             Ok(stats) => {
-                debug!(block_number, "[Worker] Successfully validated block");
+                debug!(block_number, "Successfully validated block");
                 metrics::on_validation_success(
                     start.elapsed().as_secs_f64(),
                     stats.witness_verification_time,
@@ -270,7 +260,7 @@ impl BlockProcessor for ValidatorProcessor {
                 })
             }
             Err(e) => {
-                error!(block_number, error = %e, "[Worker] Failed to validate block");
+                error!(block_number, error = %e, "Failed to validate block");
                 Err(fail(e.to_string(), false))
             }
         }

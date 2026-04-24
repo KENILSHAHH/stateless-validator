@@ -14,7 +14,7 @@ use stateless_common::RpcClient;
 use stateless_core::{
     BlockStore, LightWitness,
     db::BlockMeta,
-    pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks},
+    pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
 };
 
 use crate::{metrics, response_cache::ResponseCache};
@@ -29,23 +29,30 @@ impl BlockFetcher for TraceFetcher {
     type Output = (Block<Transaction>, LightWitness);
 
     async fn fetch(&self, block_number: u64) -> Result<(Block<Transaction>, LightWitness)> {
-        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
-        let (salt, _mpt) = self.rpc_client.get_witness(block_number, block_hash).await?;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
-        Ok((block, LightWitness::from(&salt)))
+        // Fetch header first to pin the block hash, then witness + full block in parallel.
+        // Matches the shape used by `DataProvider::do_fetch_block_data` — ~halves the wall
+        // clock under chain-sync load by overlapping the witness fetch with the full-block
+        // fetch instead of serializing all three round trips.
+        let block_hash = self.rpc_client.get_block_hash(block_number).await;
+        let (witness_res, block_res) = tokio::join!(
+            self.rpc_client.get_witness(block_number, block_hash),
+            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+        );
+        let (salt, _mpt) = witness_res;
+        Ok((block_res, LightWitness::from(&salt)))
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
-        self.rpc_client.get_latest_block_number().await
+        Ok(self.rpc_client.get_latest_block_number().await)
     }
 
     async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
-        self.rpc_client.get_block_hash(block_number).await
+        Ok(self.rpc_client.get_block_hash(block_number).await)
     }
 
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
         let header =
-            self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await?;
+            self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await;
         Ok(BlockMeta {
             block_number: header.number,
             block_hash: header.hash,
@@ -86,12 +93,16 @@ pub struct TraceProcessor;
 impl BlockProcessor for TraceProcessor {
     type Input = (Block<Transaction>, LightWitness);
     type Output = TraceProcessedBlock;
-    type Error = eyre::Report;
+    // Infallible: `process` below only rehydrates `BlockMeta` from fields the fetcher
+    // already validated. If a future edit introduces a fallible step, the compiler will
+    // force the author to pick a real error type rather than silently classifying every
+    // failure as retry-able.
+    type Error = std::convert::Infallible;
 
     async fn process(
         &self,
         (block, witness): Self::Input,
-    ) -> std::result::Result<TraceProcessedBlock, eyre::Report> {
+    ) -> std::result::Result<TraceProcessedBlock, Self::Error> {
         let meta = BlockMeta {
             block_number: block.header.number,
             block_hash: block.header.hash,
@@ -99,11 +110,6 @@ impl BlockProcessor for TraceProcessor {
             post_withdrawals_root: block.header.withdrawals_root.unwrap_or_default(),
         };
         Ok(TraceProcessedBlock { block, witness, meta })
-    }
-
-    fn error_action(&self, _: &eyre::Report) -> ErrorAction {
-        // TraceProcessor doesn't validate — errors are IO/transient, worth retrying
-        ErrorAction::Retry
     }
 }
 
@@ -126,7 +132,7 @@ impl PipelineHooks for TraceHooks {
 
     fn pre_advance(&self, items: &[TraceProcessedBlock]) -> eyre::Result<()> {
         let pairs: Vec<_> = items.iter().map(|i| (i.block.clone(), i.witness.clone())).collect();
-        self.db.store_block_data(&pairs)
+        Ok(self.db.store_block_data(&pairs)?)
     }
 
     fn post_advance(&self, new_tip: &BlockMeta) -> eyre::Result<()> {
@@ -163,7 +169,11 @@ impl PipelineHooks for TraceHooks {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    use alloy_primitives::B256;
+    use revm::state::Bytecode;
+    use stateless_core::StoreResult;
 
     use super::*;
 
@@ -174,15 +184,6 @@ mod tests {
             post_state_root: Default::default(),
             post_withdrawals_root: Default::default(),
         }
-    }
-
-    #[test]
-    fn test_trace_processed_block_implements_trait() {
-        let meta = make_block_meta(42);
-        assert_eq!(meta.block_number, 42);
-
-        // verify_continuity should be no-op for TraceProcessedBlock
-        // (tested indirectly via ProcessedBlock default impl)
     }
 
     #[test]
@@ -202,57 +203,51 @@ mod tests {
     impl stateless_core::ContractStore for MockBlockStore {
         fn get_contracts(
             &self,
-            _: &[alloy_primitives::B256],
-        ) -> eyre::Result<(
-            std::collections::HashMap<alloy_primitives::B256, revm::state::Bytecode>,
-            Vec<alloy_primitives::B256>,
-        )> {
+            _: &[B256],
+        ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
             Ok((Default::default(), vec![]))
         }
-        fn add_contracts(
-            &self,
-            _: &[(alloy_primitives::B256, revm::state::Bytecode)],
-        ) -> eyre::Result<()> {
+        fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::ChainStore for MockBlockStore {
-        fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
+        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
+        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn advance_chain(&self, _: &[BlockMeta]) -> eyre::Result<()> {
+        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
             Ok(())
         }
-        fn get_block_hash(&self, _: BlockNumber) -> eyre::Result<Option<BlockHash>> {
+        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
             Ok(None)
         }
-        fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+        fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
             Ok(None)
         }
-        fn rollback_chain(&self, _: BlockNumber) -> eyre::Result<()> {
+        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
             Ok(())
         }
-        fn reset_to_anchor(&self, _: &BlockMeta) -> eyre::Result<()> {
+        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::PrunableChainStore for MockBlockStore {
-        fn prune_chain(&self, _: BlockNumber) -> eyre::Result<u64> {
+        fn prune_chain(&self, _: BlockNumber) -> StoreResult<u64> {
             Ok(0)
         }
     }
     impl stateless_core::BlockStore for MockBlockStore {
-        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()> {
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
             &self,
             _: BlockHash,
-        ) -> eyre::Result<(Block<Transaction>, LightWitness)> {
-            Err(eyre::eyre!("not implemented"))
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+            Err(stateless_core::StoreError::Corrupt("not implemented".into()))
         }
     }
 }

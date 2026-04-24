@@ -6,14 +6,13 @@
 //!
 //! ## Modules
 //!
-//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
-//! - [`executor`]: Block validation via EVM replay
+//! - [`chain_spec`]: Chain specification and hardfork activation
+//! - [`light_witness`]: Fast witness deserialization (skips proof validation)
 //! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
 //! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
-//! - [`rpc`]: `ChainDataProvider` trait for abstracting RPC access
-//! - [`chain_spec`]: Chain specification and hardfork activation
 //! - [`data_types`]: SALT key/value encoding utilities
-//! - [`light_witness`]: Fast witness deserialization (skips proof validation)
+//! - [`executor`]: Block validation via EVM replay
+//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
 //! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
 
 pub mod chain_spec;
@@ -22,7 +21,10 @@ pub use light_witness::{LightWitness, LightWitnessExecutor};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
-pub use db::{BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore};
+pub use db::{
+    BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, MissingDataKind,
+    PrunableChainStore, StoreError, StoreResult, StoreResultExt,
+};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;

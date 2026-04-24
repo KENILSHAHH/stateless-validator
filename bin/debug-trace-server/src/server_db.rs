@@ -3,7 +3,7 @@
 //! Provides persistent storage of block data, witnesses, and canonical chain state
 //! for serving `debug_*` and `trace_*` RPC methods.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::Block;
@@ -11,16 +11,18 @@ use op_alloy_rpc_types::Transaction;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
-use stateless_common::db::{
-    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, MissingDataKind,
-    ValidationDbError, ValidationDbResult, WITNESSES, db_add_contracts, db_advance_chain,
-    db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
-    db_get_earliest_block, db_reset_to_anchor, db_rollback_chain, decode_block_from_slice,
-    decode_from_slice, encode_block_to_vec, encode_to_vec,
-};
 use stateless_core::{
     LightWitness,
-    db::{BlockMeta, BlockStore, ChainStore, ContractStore, PrunableChainStore},
+    db::{
+        BlockMeta, BlockStore, ChainStore, ContractStore, MissingDataKind, PrunableChainStore,
+        StoreError, StoreResult, StoreResultExt,
+    },
+};
+use stateless_db::{
+    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, WITNESSES,
+    decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec, read_anchor,
+    read_block_hash, read_canonical_tip, read_contracts, read_earliest_block, write_add_contracts,
+    write_advance_chain, write_reset_to_anchor, write_rollback_chain,
 };
 
 /// Block storage and chain tracking database for debug-trace-server.
@@ -30,19 +32,19 @@ pub struct ServerDB {
 
 impl ServerDB {
     /// Create a new redb instance or open an existing one.
-    pub fn new(db_path: impl AsRef<Path>) -> ValidationDbResult<Self> {
-        let database = Database::create(db_path)?;
+    pub fn new(db_path: impl AsRef<Path>) -> StoreResult<Self> {
+        let database = Database::create(db_path).store_err()?;
 
-        let write_txn = database.begin_write()?;
+        let write_txn = database.begin_write().store_err()?;
         {
-            let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let _block_data = write_txn.open_table(BLOCK_DATA)?;
-            let _witnesses = write_txn.open_table(WITNESSES)?;
-            let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
-            let _contracts = write_txn.open_table(CONTRACTS)?;
-            let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
+            let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            let _block_data = write_txn.open_table(BLOCK_DATA).store_err()?;
+            let _witnesses = write_txn.open_table(WITNESSES).store_err()?;
+            let _block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
+            let _contracts = write_txn.open_table(CONTRACTS).store_err()?;
+            let _anchor_block = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
 
         Ok(Self { database })
     }
@@ -51,7 +53,7 @@ impl ServerDB {
     pub fn store_block_data(
         &self,
         tasks: &[(Block<Transaction>, LightWitness)],
-    ) -> ValidationDbResult<()> {
+    ) -> StoreResult<()> {
         if tasks.is_empty() {
             return Ok(());
         }
@@ -59,7 +61,7 @@ impl ServerDB {
         let tasks = tasks
             .par_iter()
             .map(|(block, light_witness)| {
-                Ok::<_, ValidationDbError>((
+                Ok::<_, StoreError>((
                     block.header.number,
                     block.header.hash.0,
                     encode_block_to_vec(block)?,
@@ -68,84 +70,68 @@ impl ServerDB {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let write_txn = self.database.begin_write()?;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut block_data = write_txn.open_table(BLOCK_DATA)?;
-            let mut witnesses = write_txn.open_table(WITNESSES)?;
-            let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
+            let mut block_data = write_txn.open_table(BLOCK_DATA).store_err()?;
+            let mut witnesses = write_txn.open_table(WITNESSES).store_err()?;
+            let mut block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
 
             for (number, hash, block, light_witness) in tasks {
-                block_data.insert(hash, block)?;
-                witnesses.insert(hash, light_witness)?;
-                block_records.insert((number, hash), ())?;
+                block_data.insert(hash, block).store_err()?;
+                witnesses.insert(hash, light_witness).store_err()?;
+                block_records.insert((number, hash), ()).store_err()?;
             }
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 
     /// Gets the latest block in the local chain.
-    pub fn get_local_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
-        let read_txn = self.database.begin_read()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        Ok(chain.last()?.map(|(k, v)| {
+    pub fn get_local_tip(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        let read_txn = self.database.begin_read().store_err()?;
+        let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+        Ok(chain.last().store_err()?.map(|(k, v)| {
             let (hash, _, _) = v.value();
             (k.value(), BlockHash::from(hash))
         }))
     }
 
-    /// Resets the chain anchor point and clears all chain state.
-    pub fn reset_anchor_block(
-        &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-        post_state_root: B256,
-        post_withdrawals_root: B256,
-    ) -> ValidationDbResult<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
-            anchor_table.insert(
-                "anchor",
-                (block_number, block_hash.0, post_state_root.0, post_withdrawals_root.0),
-            )?;
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            chain.retain(|_, _| false)?;
-            chain
-                .insert(block_number, (block_hash.0, post_state_root.0, post_withdrawals_root.0))?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
     /// Cleans up old block data to save storage space.
-    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
-        let read_txn = self.database.begin_read()?;
-        let block_records = read_txn.open_table(BLOCK_RECORDS)?;
+    ///
+    /// The returned count is the number of BLOCK_RECORDS entries removed (and, by
+    /// construction, the number of matching BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows).
+    /// A second pass also removes orphaned CANONICAL_CHAIN entries below `before_block`
+    /// that had no matching BLOCK_RECORDS row — those are a side-effect and are NOT
+    /// reflected in the returned count.
+    pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
+        // Single write txn: scan + delete under one snapshot so a concurrently-committed
+        // row below `before_block` can't slip past the scan and leak as an orphan.
+        // Same pattern as `write_rollback_chain` in stateless-db's helpers.
+        let write_txn = self.database.begin_write().store_err()?;
+        let pruned_count = {
+            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            let mut block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
+            let mut block_data = write_txn.open_table(BLOCK_DATA).store_err()?;
+            let mut witnesses = write_txn.open_table(WITNESSES).store_err()?;
 
-        let keys_to_remove = block_records
-            .range(..(before_block, [0u8; 32]))?
-            .map(|result| result.map(|(key, _)| key.value()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pruned_count = keys_to_remove.len() as u64;
-
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
-            let mut block_data = write_txn.open_table(BLOCK_DATA)?;
-            let mut witnesses = write_txn.open_table(WITNESSES)?;
+            let keys_to_remove: Vec<(BlockNumber, [u8; 32])> = block_records
+                .range(..(before_block, [0u8; 32]))
+                .store_err()?
+                .map(|result| result.map(|(key, _)| key.value()))
+                .collect::<Result<Vec<_>, _>>()
+                .store_err()?;
+            let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
-                canonical_chain.remove(block_number)?;
-                block_records.remove((block_number, block_hash))?;
-                block_data.remove(block_hash)?;
-                witnesses.remove(block_hash)?;
+                canonical_chain.remove(block_number).store_err()?;
+                block_records.remove((block_number, block_hash)).store_err()?;
+                block_data.remove(block_hash).store_err()?;
+                witnesses.remove(block_hash).store_err()?;
             }
 
             // Clean up orphaned CANONICAL_CHAIN entries not tracked in BLOCK_RECORDS
             loop {
-                let block_number = match canonical_chain.first()? {
+                let block_number = match canonical_chain.first().store_err()? {
                     Some(entry) => {
                         let n = entry.0.value();
                         if n >= before_block {
@@ -155,10 +141,12 @@ impl ServerDB {
                     }
                     None => break,
                 };
-                canonical_chain.remove(block_number)?;
+                canonical_chain.remove(block_number).store_err()?;
             }
-        }
-        write_txn.commit()?;
+
+            pruned_count
+        };
+        write_txn.commit().store_err()?;
         Ok(pruned_count)
     }
 
@@ -166,18 +154,18 @@ impl ServerDB {
     pub fn get_block_and_witness(
         &self,
         block_hash: BlockHash,
-    ) -> ValidationDbResult<(Block<Transaction>, LightWitness)> {
+    ) -> StoreResult<(Block<Transaction>, LightWitness)> {
         let start = std::time::Instant::now();
 
-        let read_txn = self.database.begin_read()?;
-        let block_data = read_txn.open_table(BLOCK_DATA)?;
-        let witnesses = read_txn.open_table(WITNESSES)?;
+        let read_txn = self.database.begin_read().store_err()?;
+        let block_data = read_txn.open_table(BLOCK_DATA).store_err()?;
+        let witnesses = read_txn.open_table(WITNESSES).store_err()?;
         let txn_ms = start.elapsed().as_millis();
 
-        let block_bytes = block_data.get(block_hash.0)?.ok_or(ValidationDbError::MissingData {
-            kind: MissingDataKind::BlockData,
-            block_hash,
-        })?;
+        let block_bytes = block_data
+            .get(block_hash.0)
+            .store_err()?
+            .ok_or(StoreError::MissingData { kind: MissingDataKind::Block, block_hash })?;
         let block_bytes_value = block_bytes.value();
         let block_bytes_len = block_bytes_value.len();
         let db_read_block_ms = start.elapsed().as_millis();
@@ -186,8 +174,9 @@ impl ServerDB {
         let block_decode_ms = start.elapsed().as_millis();
 
         let witness_bytes = witnesses
-            .get(block_hash.0)?
-            .ok_or(ValidationDbError::MissingData { kind: MissingDataKind::Witness, block_hash })?;
+            .get(block_hash.0)
+            .store_err()?
+            .ok_or(StoreError::MissingData { kind: MissingDataKind::Witness, block_hash })?;
         let witness_bytes_value = witness_bytes.value();
         let witness_bytes_len = witness_bytes_value.len();
         let db_read_witness_ms = start.elapsed().as_millis();
@@ -212,61 +201,66 @@ impl ServerDB {
 }
 
 impl ContractStore for ServerDB {
-    fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        db_get_contracts(&self.database, hashes)
+    fn get_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+        read_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
-        db_add_contracts(&self.database, codes)
+    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+        write_add_contracts(&self.database, codes)
     }
 }
 
 impl ChainStore for ServerDB {
-    fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_canonical_tip(&self.database)
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+        read_canonical_tip(&self.database)
     }
 
-    fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_anchor(&self.database)
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+        read_anchor(&self.database)
     }
 
-    fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
-        db_advance_chain(&self.database, blocks)
+    fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
+        // `None`: trace server's retention is handled by the background `history_pruner`
+        // task, not inline. See `bin/debug-trace-server/src/main.rs::history_pruner`.
+        write_advance_chain(&self.database, blocks, None)
     }
 
-    fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
-        db_get_block_hash(&self.database, block_number)
+    fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        read_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
-        db_get_earliest_block(&self.database)
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        read_earliest_block(&self.database)
     }
 
-    fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
-        db_rollback_chain(&self.database, to_block)
+    fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
+        write_rollback_chain(&self.database, to_block)
     }
 
-    fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        db_reset_to_anchor(&self.database, anchor)
+    fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
+        write_reset_to_anchor(&self.database, anchor)
     }
 }
 
 impl PrunableChainStore for ServerDB {
-    fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
-        Ok(ServerDB::prune_history(self, before_block)?)
+    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
+        ServerDB::prune_history(self, before_block)
     }
 }
 
 impl BlockStore for ServerDB {
-    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()> {
-        Ok(ServerDB::store_block_data(self, blocks)?)
+    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+        ServerDB::store_block_data(self, blocks)
     }
 
     fn get_block_and_witness(
         &self,
         block_hash: BlockHash,
-    ) -> eyre::Result<(Block<Transaction>, LightWitness)> {
-        Ok(ServerDB::get_block_and_witness(self, block_hash)?)
+    ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+        ServerDB::get_block_and_witness(self, block_hash)
     }
 }
 
@@ -334,29 +328,13 @@ mod tests {
     }
 
     #[test]
-    fn test_server_db_reset_anchor_block() {
-        let (_dir, db) = temp_server_db();
-
-        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
-        ChainStore::advance_chain(&db, &blocks).unwrap();
-
-        let anchor = make_block_meta(100);
-        ChainStore::reset_to_anchor(&db, &anchor).unwrap();
-
-        assert!(ChainStore::get_block_hash(&db, 1).unwrap().is_none());
-
-        let (number, hash) = db.get_local_tip().unwrap().unwrap();
-        assert_eq!(number, 100);
-        assert_eq!(hash, anchor.block_hash);
-    }
-
-    #[test]
     fn test_server_db_contract_codes() {
         let (_dir, db) = temp_server_db();
 
         let hash1 = B256::from([1u8; 32]);
         let hash2 = B256::from([2u8; 32]);
-        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let bytecode =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
 
         ContractStore::add_contracts(&db, &[(hash1, bytecode.clone())]).unwrap();
 
@@ -395,13 +373,18 @@ mod tests {
         assert_eq!(tip, anchor);
     }
 
+    /// Exercises the CANONICAL_CHAIN orphan-cleanup side-effect of `prune_history`
+    /// (entries without a matching BLOCK_RECORDS row — e.g. rows inserted via
+    /// `advance_chain` but never through `store_block_data`).
     #[test]
-    fn test_server_db_prune_history() {
+    fn test_server_db_prune_history_orphan_cleanup_only() {
         let (_dir, db) = temp_server_db();
 
         let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &blocks).unwrap();
 
+        // BLOCK_RECORDS was never populated, so the counted-prune return is 0 even though
+        // the orphan-cleanup pass below removes rows 1 and 2 from CANONICAL_CHAIN.
         let pruned = db.prune_history(3).unwrap();
         assert_eq!(pruned, 0);
 
@@ -463,7 +446,7 @@ mod tests {
 
         let err = result.unwrap_err();
         match err {
-            ValidationDbError::MissingData { kind: MissingDataKind::BlockData, block_hash } => {
+            StoreError::MissingData { kind: MissingDataKind::Block, block_hash } => {
                 assert_eq!(block_hash, missing_hash);
             }
             other => panic!("expected MissingData error, got: {other}"),

@@ -46,10 +46,14 @@ use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{Result, anyhow};
+use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
-use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
+use stateless_core::{
+    BlockStore, ChainStore, ContractStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
+    pipeline::run_pipeline,
+};
+use stateless_db::ContractCache;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -64,7 +68,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
-use data_provider::DataProvider;
+use data_provider::{DataProvider, NoopContractStore};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::ServerDB;
@@ -134,6 +138,16 @@ struct Args {
         default_value_t = data_provider::DEFAULT_WITNESS_TIMEOUT_SECS
     )]
     witness_timeout: u64,
+
+    /// Total block-fetch timeout in seconds (header + witness + block + contracts).
+    /// Bounds `RpcClient`'s unbounded retry loop so deterministic upstream errors
+    /// (e.g. requesting a nonexistent block) surface instead of hanging the client.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BLOCK_FETCH_TIMEOUT_SECS",
+        default_value_t = data_provider::DEFAULT_BLOCK_FETCH_TIMEOUT_SECS
+    )]
+    block_fetch_timeout: u64,
 
     /// Maximum memory for response cache (e.g., "1GB", "512MB", "1024").
     #[clap(
@@ -274,7 +288,8 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         ..RpcClientConfig::trace_server()
-    };
+    }
+    .with_metrics(Arc::new(metrics::TraceRpcMetrics));
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
@@ -283,8 +298,23 @@ async fn main() -> Result<()> {
     let server_db: Option<Arc<ServerDB>> = validator_db;
     let block_store: Option<Arc<dyn BlockStore>> =
         server_db.as_ref().map(|db| Arc::clone(db) as Arc<dyn BlockStore>);
-    let data_provider =
-        Arc::new(DataProvider::new(rpc_client.clone(), block_store.clone(), args.witness_timeout));
+
+    // Contract cache: local-cache mode writes through to ServerDB, stateless mode is
+    // memory-only via `NoopContractStore`. Either way every RPC-fetched contract is
+    // cached for the lifetime of the process, so repeated trace requests skip RPC.
+    let contract_store: Arc<dyn ContractStore> = match server_db.as_ref() {
+        Some(db) => Arc::clone(db) as Arc<dyn ContractStore>,
+        None => Arc::new(NoopContractStore),
+    };
+    let contract_cache = Arc::new(ContractCache::new(contract_store));
+
+    let data_provider = Arc::new(DataProvider::new(
+        rpc_client.clone(),
+        block_store.clone(),
+        contract_cache,
+        args.witness_timeout,
+        args.block_fetch_timeout,
+    ));
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -309,12 +339,13 @@ async fn main() -> Result<()> {
         let shutdown = CancellationToken::new();
         debug!("Starting chain sync pipeline");
 
-        // Spawn unified pipeline (fetch → process → advance with reorg restart)
-        let config = Arc::new(PipelineConfig {
-            concurrent_workers: 1,
-            stale_reset_threshold: Some(args.blocks_to_keep),
-            ..PipelineConfig::default()
-        });
+        // Spawn unified pipeline (fetch → process → advance with reorg restart).
+        // `#[non_exhaustive]` on `PipelineConfig` rules out struct-update syntax across
+        // the crate boundary; mutate a default instance instead.
+        let mut pipeline_cfg = PipelineConfig::default();
+        pipeline_cfg.concurrent_workers = 1;
+        pipeline_cfg.stale_reset_threshold = Some(args.blocks_to_keep);
+        let config = Arc::new(pipeline_cfg);
         let processor = Arc::new(TraceProcessor);
         let hooks = Arc::new(TraceHooks::new(
             Arc::clone(db) as Arc<dyn BlockStore>,
@@ -407,6 +438,8 @@ async fn init_validator_db(
 
     debug!(data_dir = %data_dir, "Initializing local database");
     let work_dir = PathBuf::from(data_dir);
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
     let db = Arc::new(ServerDB::new(work_dir.join(TRACE_SERVER_DB_FILENAME))?);
 
     // Check if we already have a local tip
@@ -416,46 +449,30 @@ async fn init_validator_db(
     }
 
     // No local tip - need to initialize anchor block
-    // Use explicit start_block if provided, otherwise fetch latest
+    // Use explicit start_block if provided, otherwise fetch latest.
+    //
+    // `get_header` retries transient failures forever at the RPC layer; the binary stays
+    // stuck here until the endpoint is reachable — a permanent misconfiguration surfaces via
+    // the "no forward progress" signal rather than a bounded-retry error.
     let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash: BlockHash = start_block_str.parse()?;
-        loop {
-            match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
-                Ok(header) => break header,
-                Err(e) => {
-                    warn!(
-                        block_hash = %block_hash,
-                        error = %e,
-                        "Failed to fetch start block, retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        }
+        rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await
     } else {
-        // Auto-initialize from latest block
         info!("No local tip found, fetching latest block as anchor");
-        loop {
-            match rpc_client.get_header(BlockId::latest(), false).await {
-                Ok(header) => break header,
-                Err(e) => {
-                    warn!(error = %e, "Failed to fetch latest block, retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        }
+        rpc_client.get_header(BlockId::latest(), false).await
     };
 
-    db.reset_anchor_block(
-        header.number,
-        header.hash,
-        header.state_root,
-        header
+    let anchor = BlockMeta {
+        block_number: header.number,
+        block_hash: header.hash,
+        post_state_root: header.state_root,
+        post_withdrawals_root: header
             .withdrawals_root
-            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", header.hash))?,
-    )
-    .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
+            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?,
+    };
+    ChainStore::reset_to_anchor(&*db, &anchor)
+        .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
 
     info!(
         block_hash = %header.hash,
