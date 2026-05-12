@@ -19,6 +19,11 @@ use crate::{metrics, validator_db::ValidatorDB, workers};
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
+/// Default `--tip-buffer`. The validator races the upstream witness generator, so it stays
+/// 3 blocks behind by default. Core's `PipelineConfig::tip_buffer` defaults to `0` because
+/// the buffer is opt-in per binary; the validator opts in here.
+const DEFAULT_TIP_BUFFER: u64 = 3;
+
 /// Loads or creates a ChainSpec from the database or a genesis file.
 pub fn load_or_create_chain_spec(
     validator_db: &ValidatorDB,
@@ -115,6 +120,13 @@ pub struct CommandLineArgs {
     /// Pipeline restart delay after a transient cycle error (milliseconds).
     #[clap(long, env = "STATELESS_VALIDATOR_ERROR_RESTART_DELAY_MS")]
     pub error_restart_delay_ms: Option<u64>,
+
+    /// Safety margin below the remote tip: the fetcher will not spawn fetches for blocks
+    /// `> chain_latest - tip_buffer`. Gives the upstream witness generator headroom to
+    /// finish the very block we'd otherwise race it for. `0` disables the buffer. Defaults
+    /// to `DEFAULT_TIP_BUFFER`.
+    #[clap(long, env = "STATELESS_VALIDATOR_TIP_BUFFER")]
+    pub tip_buffer: Option<u64>,
 
     /// Initial round-level RPC retry backoff (milliseconds). Applied after every provider in a
     /// round has failed; doubles each round up to `--rpc-max-backoff-ms`.
@@ -260,9 +272,7 @@ pub async fn run() -> Result<()> {
         override_ms(args.poll_interval_ms, pipeline_config.poll_interval);
     pipeline_config.error_restart_delay =
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
-    // Stay 3 blocks behind the remote tip so the upstream witness generator has headroom
-    // to finish the block we'd otherwise race it for.
-    pipeline_config.tip_buffer = 3;
+    pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
 
     let result = workers::run_with_signals(
         client,
